@@ -70,6 +70,26 @@ def patch_class_property(cls, prop_name, new_getter):
     _ORIGINAL_METHODS[method_key] = original_prop
     setattr(cls, prop_name, property(new_getter))
 
+def replace_method(cls, method_name, new_method_factory):
+    """
+    Completely replace a method with a new one implementation.
+    new_method_factory(original_method) -> new_method
+    """
+    if not hasattr(cls, method_name):
+        return
+
+    method_key = _get_method_key(cls, method_name)
+    if method_key in _ORIGINAL_METHODS:
+        # Already patched, avoid double patch or allow override?
+        # For simplicity, avoid double patch
+        return
+
+    original_method = getattr(cls, method_name)
+    _ORIGINAL_METHODS[method_key] = original_method
+    
+    new_method = new_method_factory(original_method)
+    setattr(cls, method_name, new_method)
+
 def restore_all():
     for key, original_method in _ORIGINAL_METHODS.items():
         parts = key.rsplit(".", 2) 
