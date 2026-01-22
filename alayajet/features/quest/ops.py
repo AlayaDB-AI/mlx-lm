@@ -46,35 +46,42 @@ def append_kv(
         k_chunk = k[current_offset_in_input : current_offset_in_input + tokens_to_write]
         v_chunk = v[current_offset_in_input : current_offset_in_input + tokens_to_write]
         
-        # Convert to numpy (Cast to float32 first to handle bfloat16 compatibility)
-        k_np = np.array(k_chunk.astype(mx.float32))
-        v_np = np.array(v_chunk.astype(mx.float32))
+        k_chunk_f32 = k_chunk.astype(mx.float32)
+        v_chunk_f32 = v_chunk.astype(mx.float32)
         
         is_last_page = (page_idx == len(controller.kv_cache.active_indices) - 1)
         
         if is_last_page:
             buffer = controller.kv_cache.get_active_buffer(layer_idx)
             # buffer shape: (2, page_size, H_kv, D)
+            k_np = np.array(k_chunk_f32)
+            v_np = np.array(v_chunk_f32)
             buffer[0, page_offset : page_offset + tokens_to_write] = k_np
             buffer[1, page_offset : page_offset + tokens_to_write] = v_np
             
-            # Update Metadata immediately
-            current_valid_len = page_offset + tokens_to_write
-            valid_k = buffer[0, :current_valid_len]
-            
-            k_min = mx.array(np.min(valid_k, axis=0))
-            k_max = mx.array(np.max(valid_k, axis=0))
+            # Update Metadata incrementally to avoid rescanning the active page.
+            chunk_k_min = np.min(k_np, axis=0)
+            chunk_k_max = np.max(k_np, axis=0)
             
             # Use physical index for metadata
             phys_page_idx = controller.kv_cache.active_indices[page_idx]
-            controller.update_metadata(layer_idx, phys_page_idx, k_min, k_max)
+            if page_offset == 0:
+                controller.update_metadata(layer_idx, phys_page_idx, chunk_k_min, chunk_k_max)
+            else:
+                prev_min = controller.metadata_pool[layer_idx, phys_page_idx, 0]
+                prev_max = controller.metadata_pool[layer_idx, phys_page_idx, 1]
+                new_min = np.minimum(prev_min, chunk_k_min)
+                new_max = np.maximum(prev_max, chunk_k_max)
+                controller.update_metadata(layer_idx, phys_page_idx, new_min, new_max)
             
         else:
             physical_block_idx = controller.kv_cache.active_indices[page_idx]
             
             # Write K
+            k_np = np.array(k_chunk_f32)
             controller.kv_cache.disk_pool[layer_idx, physical_block_idx, 0, page_offset : page_offset + tokens_to_write] = k_np
             # Write V
+            v_np = np.array(v_chunk_f32)
             controller.kv_cache.disk_pool[layer_idx, physical_block_idx, 1, page_offset : page_offset + tokens_to_write] = v_np
             
             # Metadata update for disk page
@@ -86,18 +93,18 @@ def append_kv(
             
             if page_offset == 0:
                 # First write to this page (or full overwrite), set metadata directly
-                controller.update_metadata(layer_idx, physical_block_idx, mx.array(chunk_k_min), mx.array(chunk_k_max))
+                controller.update_metadata(layer_idx, physical_block_idx, chunk_k_min, chunk_k_max)
             else:
                 # Partial update: Merge with existing metadata
                 # metadata_pool shape: (layers, capacity, 2, H, D)
                 
-                prev_min = controller.metadata_pool[layer_idx, physical_block_idx, 0]
-                prev_max = controller.metadata_pool[layer_idx, physical_block_idx, 1]
+                prev_min = controller.metadata_pool[layer_idx][physical_block_idx, 0]
+                prev_max = controller.metadata_pool[layer_idx][physical_block_idx, 1]
                 
                 new_min = np.minimum(prev_min, chunk_k_min)
                 new_max = np.maximum(prev_max, chunk_k_max)
                 
-                controller.update_metadata(layer_idx, physical_block_idx, mx.array(new_min), mx.array(new_max))
+                controller.update_metadata(layer_idx, physical_block_idx, new_min, new_max)
         
         current_offset_in_input += tokens_to_write
         remaining -= tokens_to_write
@@ -201,11 +208,8 @@ def decode_sparse_attn(
     valid_len = controller.kv_cache.last_page_len
     
     # Active buffer is (2, page_size, H_kv, D)
-    last_k_np = active_buffer[0, :valid_len] # (Len, H_kv, D)
-    last_v_np = active_buffer[1, :valid_len]
-    
-    last_k_mx = mx.array(last_k_np).astype(q.dtype)
-    last_v_mx = mx.array(last_v_np).astype(q.dtype)
+    last_k_mx = mx.array(active_buffer[0, :valid_len]).astype(q.dtype) # (Len, H_kv, D)
+    last_v_mx = mx.array(active_buffer[1, :valid_len]).astype(q.dtype)
     
     num_heads = q.shape[1] # H_q
     num_kv_heads = controller.kv_cache.num_heads # H_kv

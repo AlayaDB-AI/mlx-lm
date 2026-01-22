@@ -80,8 +80,6 @@ def replace_method(cls, method_name, new_method_factory):
 
     method_key = _get_method_key(cls, method_name)
     if method_key in _ORIGINAL_METHODS:
-        # Already patched, avoid double patch or allow override?
-        # For simplicity, avoid double patch
         return
 
     original_method = getattr(cls, method_name)

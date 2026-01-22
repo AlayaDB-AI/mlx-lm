@@ -4,6 +4,7 @@ from .features.base import AlayaFeature
 from .features.offload import OffloadFeature
 from .features.monitor import VRAMMonitorFeature
 from .features.chunking import ChunkComputationFeature
+from .features.quest.integration import QuestFeature
 
 class AlayaEngine:
     def __init__(self):
@@ -68,26 +69,20 @@ class AlayaEngine:
         engine.add_feature(OffloadFeature(cache_dir))
         return engine
 
-        @classmethod
+    @classmethod
+    def with_monitor(cls, interval: int = 4):
+        engine = cls()
+        engine.add_feature(VRAMMonitorFeature(interval=interval))
+        return engine
 
-        def with_monitor(cls, interval: int = 4):
+    @classmethod
+    def with_chunking(cls, chunk_size: int = 4096):
+        engine = cls()
+        engine.add_feature(ChunkComputationFeature(chunk_size=chunk_size))
+        return engine
 
-            engine = cls()
-
-            engine.add_feature(VRAMMonitorFeature(interval=interval))
-
-            return engine
-
-    
-
-        @classmethod
-
-        def with_chunking(cls, chunk_size: int = 4096):
-
-            engine = cls()
-
-            engine.add_feature(ChunkComputationFeature(chunk_size=chunk_size))
-
-            return engine
-
-    
+    @classmethod
+    def with_quest(cls, page_budget: int = 128, cache_dir: str = "./kv_quest_tmp", async_disk_write: bool = False):
+        engine = cls()
+        engine.add_feature(QuestFeature(page_budget=page_budget, cache_dir=cache_dir, async_disk_write=async_disk_write))
+        return engine

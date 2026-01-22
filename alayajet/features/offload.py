@@ -37,12 +37,6 @@ class OffloadManager:
 class OffloadFeature(AlayaFeature):
     def __init__(self, cache_dir: str = "./kv_offload_tmp"):
         self.manager = OffloadManager(cache_dir)
-        # We need to manually track layers if the engine doesn't provide global context
-        # But Engine will be responsible for maintaining a layer counter?
-        # Actually, let's keep the counter here or in the Engine.
-        # It's cleaner if Engine tracks "current layer index" during the forward pass.
-        # But Engine relies on hooks too.
-        # Let's let the Feature track its own state if needed, or Engine passes layer_idx.
         pass
 
     def on_attach(self, engine):
@@ -51,9 +45,6 @@ class OffloadFeature(AlayaFeature):
         print(f"[AlayaJet] OffloadFeature enabled. Dir: {self.manager.cache_dir}")
 
     def on_model_start(self, model):
-        # We don't need to reset counter here if Engine passes layer_idx,
-        # BUT Engine needs to know when to reset its counter.
-        # So Engine handles the counter reset on model start.
         pass
 
     def on_attention_pre(self, layer_idx: int, x, mask=None, cache=None):

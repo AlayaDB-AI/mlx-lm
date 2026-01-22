@@ -7,10 +7,11 @@ from ...patch_utils import replace_method, patch_class_property
 import mlx_lm.models.cache as cache_module
 
 class QuestFeature(AlayaFeature):
-    def __init__(self, page_budget: int = 128, cache_dir: str = "./kv_quest_tmp"):
+    def __init__(self, page_budget: int = 128, cache_dir: str = "./kv_quest_tmp", async_disk_write: bool = False):
         super().__init__()
         self.page_budget = page_budget
         self.cache_dir = cache_dir
+        self.async_disk_write = async_disk_write
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
@@ -35,10 +36,6 @@ class QuestFeature(AlayaFeature):
             elif hasattr(self.config, "max_sequence_length"): # Qwen/others might use this
                 self.max_seq_len = self.config.max_sequence_length
             
-        # We need to replace the Attention class's __call__ method completely
-        # because Quest changes the internal logic significantly (no standard cache usage).
-        # We use replace_method from patch_utils
-        
         # Identify Attention Class
         # Similar to patch_model logic
         layers = getattr(self.model, "layers", []) or getattr(self.model.model, "layers", [])
@@ -52,11 +49,7 @@ class QuestFeature(AlayaFeature):
              return
              
         attn_cls = type(first_layer.self_attn)
-        
-        # Replace __call__ with our quest_attention_forward
-        # We need a factory that takes original method (we might ignore it or use parts of it)
-        # But wait, original method has `self`, we need to capture `self` (the layer instance).
-        
+         
         def quest_forward_factory(original_forward):
             # This is the new method. `self` is the Attention layer instance.
             def new_forward(attn_self, x: mx.array, mask=None, cache=None):
@@ -68,10 +61,8 @@ class QuestFeature(AlayaFeature):
 
     def on_model_start(self, model):
         # Initialize Controller if not ready or dimensions changed?
-        # We need model dimensions.
         if self.controller is None:
             # Get dimensions from config or first layer
-            # We assume homogeneous layers
             config = self.config
             
             num_layers = config.num_hidden_layers
@@ -101,7 +92,8 @@ class QuestFeature(AlayaFeature):
                 max_seq_len=self.max_seq_len,
                 num_kv_heads=num_kv_heads,
                 cache_dir=self.cache_dir,
-                dtype=mx.float16 # TODO: Match model dtype
+                dtype=mx.float16, # TODO: Match model dtype
+                async_disk_write=self.async_disk_write
             )
             print(f"[Quest] Controller Initialized: {self.page_budget} pages budget, disk cache at {self.cache_dir}")
         
@@ -126,6 +118,11 @@ class QuestFeature(AlayaFeature):
         q = q.reshape(B, L, num_heads, head_dim)
         k = k.reshape(B, L, num_kv_heads, head_dim)
         v = v.reshape(B, L, num_kv_heads, head_dim)
+
+        if hasattr(attn_layer, "q_norm"):
+            q = attn_layer.q_norm(q)
+        if hasattr(attn_layer, "k_norm"):
+            k = attn_layer.k_norm(k)
         
         # 2. Quest Logic
         layer_idx = self.engine.layer_counter
@@ -196,8 +193,9 @@ class QuestFeature(AlayaFeature):
                 scores = decode_estimate(q_in, self.controller, layer_idx)
                 topk = decode_topk(scores, self.controller.inference_page_budget)
             else:
-                scores = decode_estimate(q_in, self.controller, layer_idx)
-                topk = decode_topk(scores, self.controller.inference_page_budget)
+                num_pages = len(self.controller.kv_indices_without_last)
+                base_indices = mx.arange(num_pages)[None, :]
+                topk = mx.repeat(base_indices, q_in.shape[1], axis=0)
 
             # 2. Sparse Attn
             # q_in: (1, H, D) -> need (1, H, 1, D) for SDPA

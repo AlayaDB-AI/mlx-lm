@@ -2,6 +2,8 @@ import mlx.core as mx
 import numpy as np
 import os
 import shutil
+import queue
+import threading
 from typing import List, Optional, Set, Tuple, Dict
 
 class DiskOffloadKvCache:
@@ -18,7 +20,8 @@ class DiskOffloadKvCache:
         page_size: int,
         dtype=np.float32,
         cache_dir: str = "./kv_cache_tmp",
-        name: str = "kv_cache"
+        name: str = "kv_cache",
+        async_disk_write: bool = False
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads # Stores num_kv_heads
@@ -27,6 +30,7 @@ class DiskOffloadKvCache:
         self.dtype = dtype
         self.name = name
         self.cache_dir = cache_dir
+        self.async_disk_write = async_disk_write
 
         # Capacity in number of pages/blocks
         self.capacity = (max_seq_len + page_size - 1) // page_size
@@ -47,6 +51,16 @@ class DiskOffloadKvCache:
             mode='w+',
             shape=self.shape
         )
+
+        self._disk_write_queue: Optional[queue.Queue] = None
+        self._disk_write_thread: Optional[threading.Thread] = None
+        if self.async_disk_write:
+            self._disk_write_queue = queue.Queue()
+            self._disk_write_thread = threading.Thread(
+                target=self._disk_write_worker,
+                daemon=True
+            )
+            self._disk_write_thread.start()
         
         # Track free blocks (simple stack allocator)
         self.free_slots = set(range(self.capacity))
@@ -54,7 +68,7 @@ class DiskOffloadKvCache:
         # Active page indices (ordered list of pages used by the sequence)
         self.active_indices: List[int] = []
         
-        # Active buffers in RAM: layer_idx -> np.array or mx.array
+        # Active buffers in RAM: layer_idx -> np.array
         # These hold the current page being filled to avoid frequent small writes to disk
         self.active_buffers: Dict[int, np.ndarray] = {}
         
@@ -99,7 +113,7 @@ class DiskOffloadKvCache:
                 for l in range(self.num_layers):
                     # Shape: (2, page_size, num_heads, head_dim)
                     self.active_buffers[l] = np.zeros(
-                        (2, self.page_size, self.num_heads, self.head_dim), 
+                        (2, self.page_size, self.num_heads, self.head_dim),
                         dtype=self.dtype
                     )
             self.seq_len += 1
@@ -108,7 +122,7 @@ class DiskOffloadKvCache:
     def flush_active_buffers(self, page_idx: int):
         """Writes active buffers to disk pool."""
         for l, buffer in self.active_buffers.items():
-            self.disk_pool[l, page_idx] = buffer
+            self._write_disk_pool(l, page_idx, buffer)
             
     def get_active_buffer(self, layer_idx: int) -> np.ndarray:
         return self.active_buffers[layer_idx]
@@ -127,11 +141,31 @@ class DiskOffloadKvCache:
         return mx.array(pages_np)
 
     def release(self):
+        if self._disk_write_queue is not None:
+            self._disk_write_queue.join()
         self.seq_len = 0
         # Reset free slots
         self.free_slots = set(range(self.capacity))
         self.active_indices.clear()
         self.active_buffers.clear()
+
+    def _write_disk_pool(self, layer_idx: int, page_idx: int, buffer_np: np.ndarray):
+        if self._disk_write_queue is None:
+            self.disk_pool[layer_idx, page_idx] = buffer_np
+            return
+        self._disk_write_queue.put((layer_idx, page_idx, buffer_np))
+
+    def _disk_write_worker(self):
+        if self._disk_write_queue is None:
+            return
+        while True:
+            item = self._disk_write_queue.get()
+            if item is None:
+                self._disk_write_queue.task_done()
+                break
+            layer_idx, page_idx, buffer_np = item
+            self.disk_pool[layer_idx, page_idx] = buffer_np
+            self._disk_write_queue.task_done()
 
 
 class QuestController:
@@ -148,7 +182,8 @@ class QuestController:
         max_seq_len: int,
         num_kv_heads: Optional[int] = None, # Added parameter
         dtype=mx.float16,
-        cache_dir: str = "./kv_cache_tmp"
+        cache_dir: str = "./kv_cache_tmp",
+        async_disk_write: bool = False
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -170,7 +205,8 @@ class QuestController:
             page_size=page_size,
             dtype=np_dtype,
             cache_dir=cache_dir,
-            name="kv_cache"
+            name="kv_cache",
+            async_disk_write=async_disk_write
         )
         
         # Metadata Cache (RAM)
@@ -181,7 +217,7 @@ class QuestController:
         
         # Using numpy for mutable access (Metadata is small enough to stay in RAM)
         self.metadata_pool = np.zeros(
-            (num_layers, max_kv_pages, 2, self.num_kv_heads, head_dim), 
+            (num_layers, max_kv_pages, 2, self.num_kv_heads, head_dim),
             dtype=np.float32
         )
         
@@ -205,7 +241,6 @@ class QuestController:
         Updates metadata for a specific page.
         """
         # k_min, k_max: (num_kv_heads, head_dim) - MLX arrays
-        # Convert to numpy
         k_min_np = np.array(k_min)
         k_max_np = np.array(k_max)
         
@@ -219,8 +254,7 @@ class QuestController:
         if not page_indices:
             return mx.array([])
         
-        # Fancy indexing with numpy
-        data = self.metadata_pool[layer_idx, page_indices] # (NumPages, 2, H_kv, D)
+        data = self.metadata_pool[layer_idx, page_indices]
         # Transpose to (2, NumPages, H_kv, D) to match expected logic
         data = data.transpose(1, 0, 2, 3)
         return mx.array(data)

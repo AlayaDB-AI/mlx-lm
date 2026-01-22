@@ -59,7 +59,7 @@ def main():
         shutil.rmtree(cache_dir)
         
     print(f"--- Attaching Quest Engine (Budget: {page_budget} pages) ---")
-    engine = AlayaEngine.with_quest(page_budget=page_budget, cache_dir=cache_dir)
+    engine = AlayaEngine.with_quest(page_budget=page_budget, cache_dir=cache_dir, async_disk_write=True)
     engine.attach(model)
     
     # 3. Generate
