@@ -1,0 +1,170 @@
+import argparse
+import json
+import time
+import os
+import mlx.core as mx
+from mlx_lm import load, generate
+from alayajet.engine import AlayaEngine
+
+# LongBench NarrativeQA Prompt Template
+PROMPT_TEMPLATE = (
+    "You are given a story, which is a long document. Please answer the question based on the story.\n\n"
+    "Story:\n"
+    "{context}\n\n"
+    "Question: {input}\n\n"
+    "Answer:"
+)
+
+def load_jsonl(file_path, num_samples):
+    samples = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if i >= num_samples:
+                break
+            samples.append(json.loads(line))
+    return samples
+
+def main():
+    parser = argparse.ArgumentParser(description="Lite Evaluation on LongBench NarrativeQA")
+    parser.add_argument("--model", type=str, default="mlx-community/Qwen2.5-7B-Instruct-1M-4bit", help="Model path")
+    parser.add_argument("--quest", action="store_true", help="Enable Quest Feature")
+    parser.add_argument("--page-budget", type=int, default=128, help="Quest page budget")
+    parser.add_argument("--num-samples", type=int, default=1, help="Number of samples to evaluate")
+    parser.add_argument("--data-path", type=str, default="benchmarks/data/LongBench/narrativeqa.jsonl", help="Path to narrativeqa.jsonl")
+    parser.add_argument("--cache-dir", type=str, default="./kv_cache_eval", help="Quest cache directory")
+    parser.add_argument("--max-tokens", type=int, default=32, help="Max tokens for generation")
+    parser.add_argument("--timing", action="store_true", help="Enable baseline timing breakdown")
+    parser.add_argument(
+        "--timing-sync",
+        dest="timing_sync",
+        action="store_true",
+        default=True,
+        help="Sync MLX ops for accurate timing (default)"
+    )
+    parser.add_argument(
+        "--timing-no-sync",
+        dest="timing_sync",
+        action="store_false",
+        help="Do not sync MLX ops (lower overhead, less accurate)"
+    )
+    parser.add_argument("--quest-timing", action="store_true", help="Enable Quest timing breakdown")
+    parser.add_argument(
+        "--quest-timing-sync",
+        dest="quest_timing_sync",
+        action="store_true",
+        default=True,
+        help="Sync MLX ops for accurate timing (default)"
+    )
+    parser.add_argument(
+        "--quest-timing-no-sync",
+        dest="quest_timing_sync",
+        action="store_false",
+        help="Do not sync MLX ops (lower overhead, less accurate)"
+    )
+    
+    args = parser.parse_args()
+    
+    if not os.path.exists(args.data_path):
+        print(f"Error: Data file {args.data_path} not found.")
+        return
+
+    print(f"--- LongBench Lite Eval ---")
+    print(f"Model: {args.model}")
+    print(f"Quest: {args.quest} (Budget: {args.page_budget})")
+    print(f"Samples: {args.num_samples}")
+    if args.quest and args.timing and not args.quest_timing:
+        print("[Timing] Baseline timing is ignored with --quest; use --quest-timing for Quest breakdown.")
+
+    # 1. Load Model & Engine
+    print("Loading model...")
+    model, tokenizer = load(args.model)
+    
+    engine = None
+    if args.quest:
+        print(f"Attaching Quest Engine (with Chunking)...")
+        if os.path.exists(args.cache_dir):
+            import shutil
+            shutil.rmtree(args.cache_dir)
+        
+        engine = AlayaEngine.with_quest(
+            page_budget=args.page_budget, 
+            cache_dir=args.cache_dir,
+            async_disk_write=True,
+            timing=args.quest_timing,
+            timing_sync=args.quest_timing_sync
+        )
+        
+        from alayajet.features.chunking import ChunkComputationFeature
+        engine.add_feature(ChunkComputationFeature(chunk_size=2048))
+        
+        engine.attach(model)
+    elif args.timing:
+        from alayajet.features.timing import TimingFeature
+        engine = AlayaEngine()
+        engine.add_feature(TimingFeature(timing_sync=args.timing_sync))
+        engine.attach(model)
+
+    # 2. Load Data
+    samples = load_jsonl(args.data_path, args.num_samples)
+    
+    results = []
+    
+    for idx, sample in enumerate(samples):
+        print(f"\n[{idx+1}/{args.num_samples}] Task: {sample.get('dataset', 'narrativeqa')}")
+        
+        prompt = PROMPT_TEMPLATE.format(context=sample['context'], input=sample['input'])
+        
+        # Qwen Chat Template
+        if hasattr(tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": prompt}]
+            prompt_formatted = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        else:
+            prompt_formatted = prompt
+            
+        token_count = len(tokenizer.encode(prompt_formatted))
+        print(f"Context Length: {sample.get('length')} | Prompt Tokens: {token_count}")
+        
+        start_time = time.time()
+        
+        # Generation
+        prefill_step_size = 2048
+        print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
+        
+        prediction = generate(
+            model, 
+            tokenizer, 
+            prompt=prompt_formatted, 
+            max_tokens=args.max_tokens, 
+            verbose=False,
+            prefill_step_size=prefill_step_size
+        )
+        
+        duration = time.time() - start_time
+        prediction = prediction.strip()
+        
+        print(f"Question: {sample['input']}")
+        print(f"Prediction: {prediction}")
+        print(f"Ground Truth: {sample['answers']}")
+        print(f"Latency: {duration:.2f}s")
+        
+        results.append({
+            "input": sample['input'],
+            "prediction": prediction,
+            "answers": sample['answers'],
+            "tokens": token_count,
+            "latency": duration
+        })
+
+    # 3. Summary
+    print("\n" + "="*50)
+    print("Evaluation Summary")
+    print("="*50)
+    avg_latency = sum(r['latency'] for r in results) / len(results)
+    print(f"Average Latency: {avg_latency:.2f}s")
+    
+    # Detach
+    if engine:
+        engine.detach()
+
+if __name__ == "__main__":
+    main()

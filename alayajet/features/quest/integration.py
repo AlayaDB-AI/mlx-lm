@@ -1,5 +1,7 @@
 import mlx.core as mx
 import mlx.nn as nn
+import time
+from collections import defaultdict
 from ..base import AlayaFeature
 from .kv_cache import QuestController
 from .ops import append_kv, decode_estimate, decode_topk, decode_sparse_attn, apply_rope_in_place
@@ -7,15 +9,52 @@ from ...patch_utils import replace_method, patch_class_property
 import mlx_lm.models.cache as cache_module
 
 class QuestFeature(AlayaFeature):
-    def __init__(self, page_budget: int = 128, cache_dir: str = "./kv_quest_tmp", async_disk_write: bool = False):
+    def __init__(
+        self,
+        page_budget: int = 128,
+        cache_dir: str = "./kv_quest_tmp",
+        async_disk_write: bool = False,
+        timing: bool = False,
+        timing_sync: bool = True
+    ):
         super().__init__()
         self.page_budget = page_budget
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
+        self.timing_enabled = timing
+        self.timing_sync = timing_sync
+        self._timing_stats = defaultdict(lambda: [0.0, 0])
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
         
+    def _record_timing(self, key: str, start_time: float, *sync_arrays):
+        if not self.timing_enabled:
+            return
+        if self.timing_sync and sync_arrays:
+            to_sync = [arr for arr in sync_arrays if arr is not None]
+            if to_sync:
+                mx.eval(to_sync)
+        elapsed = time.perf_counter() - start_time
+        stat = self._timing_stats[key]
+        stat[0] += elapsed
+        stat[1] += 1
+
+    def report_timing(self, reset: bool = False, prefix: str = "[Quest][Timing]"):
+        if not self._timing_stats:
+            return
+        print(prefix)
+        for key in sorted(self._timing_stats.keys()):
+            total, count = self._timing_stats[key]
+            avg = total / count if count else 0.0
+            print(f"  {key}: total {total:.3f}s, avg {avg*1000:.3f}ms, n={count}")
+        if reset:
+            self._timing_stats.clear()
+
+    def on_detach(self):
+        if self.timing_enabled:
+            self.report_timing(prefix="[Quest][Timing][Summary]")
+
     def on_attach(self, engine):
         self.engine = engine
         self.model = engine.model
@@ -104,6 +143,7 @@ class QuestFeature(AlayaFeature):
         The replacement forward function for Attention layers.
         """
         # 1. Projections
+        t_proj = time.perf_counter() if self.timing_enabled else None
         q = attn_layer.q_proj(x)
         k = attn_layer.k_proj(x)
         v = attn_layer.v_proj(x)
@@ -123,6 +163,8 @@ class QuestFeature(AlayaFeature):
             q = attn_layer.q_norm(q)
         if hasattr(attn_layer, "k_norm"):
             k = attn_layer.k_norm(k)
+        if self.timing_enabled:
+            self._record_timing("proj", t_proj, q, k, v)
         
         # 2. Quest Logic
         layer_idx = self.engine.layer_counter
@@ -137,6 +179,7 @@ class QuestFeature(AlayaFeature):
 
         # 3. RoPE
         if hasattr(attn_layer, "rope"):
+            t_rope = time.perf_counter() if self.timing_enabled else None
             # prepare_metadata increments seq_len by L (for the current batch)
             # So the correct starting offset for this batch is seq_len - L
             offset = self.controller.kv_cache.seq_len - L
@@ -147,6 +190,8 @@ class QuestFeature(AlayaFeature):
                  k = attn_layer.rope(k, offset=offset)
                  q = q.transpose(0, 2, 1, 3)
                  k = k.transpose(0, 2, 1, 3)
+            if self.timing_enabled:
+                self._record_timing("rope", t_rope, q, k)
             
         # 4. Append KV
         if B != 1:
@@ -157,7 +202,10 @@ class QuestFeature(AlayaFeature):
         q_in = q.squeeze(0)
         
         # Append (No repeat needed, ops handle GQA now)
+        t_append = time.perf_counter() if self.timing_enabled else None
         append_kv(k_in, v_in, self.controller, layer_idx)
+        if self.timing_enabled:
+            self._record_timing("append_kv", t_append)
         
         # 5. Attention
         if L > 1:
@@ -175,23 +223,34 @@ class QuestFeature(AlayaFeature):
                 k_p = mx.repeat(k_p, n_rep, axis=1)
                 v_p = mx.repeat(v_p, n_rep, axis=1)
             
-            # Causal mask
-            mask = nn.MultiHeadAttention.create_additive_causal_mask(L)
-            mask = mask.astype(q_p.dtype)
+            # Causal mask: use built-in causal mode to avoid materializing an LxL mask.
+            mask = "causal"
             
-            out = mx.fast.scaled_dot_product_attention(q_p, k_p, v_p, scale=1.0/mx.sqrt(head_dim), mask=mask)
+            t_prefill = time.perf_counter() if self.timing_enabled else None
+            out = mx.fast.scaled_dot_product_attention(
+                q_p, k_p, v_p, scale=1.0 / mx.sqrt(head_dim), mask=mask
+            )
+            if self.timing_enabled:
+                self._record_timing("prefill_attn", t_prefill, out)
             
             # Output is (B, H, L, D) -> (B, L, H, D)
             out = out.transpose(0, 2, 1, 3)
+            
+            # Best-effort release of large temporaries.
+            del q_p, k_p, v_p, mask
             
         else:
             # Decode: Quest Sparse Attention
             
             # 1. Estimate
             # q_in: (1, H, D)
-            if self.controller.need_estimate():
+            need_estimate = self.controller.need_estimate()
+            if need_estimate:
+                t_est = time.perf_counter() if self.timing_enabled else None
                 scores = decode_estimate(q_in, self.controller, layer_idx)
                 topk = decode_topk(scores, self.controller.inference_page_budget)
+                if self.timing_enabled:
+                    self._record_timing("decode_estimate_topk", t_est, topk)
             else:
                 num_pages = len(self.controller.kv_indices_without_last)
                 base_indices = mx.arange(num_pages)[None, :]
@@ -202,16 +261,30 @@ class QuestFeature(AlayaFeature):
             # Transpose (L, H, D) to (H, L, D) then expand to (1, H, L, D)
             q_sdpa = mx.expand_dims(q_in.transpose(1, 0, 2), axis=0) 
             
+            t_sparse = time.perf_counter() if self.timing_enabled else None
             out_sdpa = decode_sparse_attn(q_sdpa, topk, self.controller, layer_idx)
+            if self.timing_enabled:
+                self._record_timing("decode_sparse_attn", t_sparse, out_sdpa)
             # out_sdpa: (1, H, 1, D)
             
             # Reshape to (B, L, H, D) -> (1, 1, H, D)
             out = out_sdpa.transpose(0, 2, 1, 3) # (1, 1, H, D)
+            
+            # Best-effort release of large temporaries.
+            del q_sdpa, out_sdpa, topk
+            if need_estimate:
+                del scores
+
+        # Best-effort release of per-layer QKV intermediates.
+        del q, k, v, q_in, k_in, v_in
 
         # 6. Output Projection
         # Reshape to (B, L, Hidden)
+        t_out = time.perf_counter() if self.timing_enabled else None
         out = out.reshape(B, L, -1)
         out = attn_layer.o_proj(out)
+        if self.timing_enabled:
+            self._record_timing("o_proj", t_out, out)
         
         # Manually increment layer counter since we bypassed the engine hook
         self.engine.layer_counter += 1

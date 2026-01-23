@@ -82,7 +82,22 @@ class AlayaEngine:
         return engine
 
     @classmethod
-    def with_quest(cls, page_budget: int = 128, cache_dir: str = "./kv_quest_tmp", async_disk_write: bool = False):
+    def with_quest(
+        cls,
+        page_budget: int = 128,
+        cache_dir: str = "./kv_quest_tmp",
+        async_disk_write: bool = False,
+        timing: bool = False,
+        timing_sync: bool = True
+    ):
         engine = cls()
-        engine.add_feature(QuestFeature(page_budget=page_budget, cache_dir=cache_dir, async_disk_write=async_disk_write))
+        engine.add_feature(
+            QuestFeature(
+                page_budget=page_budget,
+                cache_dir=cache_dir,
+                async_disk_write=async_disk_write,
+                timing=timing,
+                timing_sync=timing_sync
+            )
+        )
         return engine

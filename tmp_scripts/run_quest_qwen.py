@@ -60,6 +60,11 @@ def main():
         
     print(f"--- Attaching Quest Engine (Budget: {page_budget} pages) ---")
     engine = AlayaEngine.with_quest(page_budget=page_budget, cache_dir=cache_dir, async_disk_write=True)
+    
+    # Enable MLP Chunking to save VRAM during prefill
+    from alayajet.features.chunking import ChunkComputationFeature
+    engine.add_feature(ChunkComputationFeature(chunk_size=1024))
+    
     engine.attach(model)
     
     # 3. Generate
