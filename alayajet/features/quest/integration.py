@@ -1,10 +1,9 @@
 import mlx.core as mx
-import mlx.nn as nn
 import time
-from collections import defaultdict
 from ..base import AlayaFeature
 from .kv_cache import QuestController
 from .ops import append_kv, decode_estimate, decode_topk, decode_sparse_attn, apply_rope_in_place
+from .timing import QuestTiming
 from ...patch_utils import replace_method, patch_class_property
 import mlx_lm.models.cache as cache_module
 
@@ -15,45 +14,23 @@ class QuestFeature(AlayaFeature):
         cache_dir: str = "./kv_quest_tmp",
         async_disk_write: bool = False,
         timing: bool = False,
-        timing_sync: bool = True
+        timing_sync: bool = True,
+        trace_output: str | None = None
     ):
         super().__init__()
         self.page_budget = page_budget
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
-        self.timing_enabled = timing
-        self.timing_sync = timing_sync
-        self._timing_stats = defaultdict(lambda: [0.0, 0])
+        self.timing = QuestTiming(enabled=timing, sync=timing_sync, trace_output=trace_output)
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
+        self._prefill_start = None
         
-    def _record_timing(self, key: str, start_time: float, *sync_arrays):
-        if not self.timing_enabled:
-            return
-        if self.timing_sync and sync_arrays:
-            to_sync = [arr for arr in sync_arrays if arr is not None]
-            if to_sync:
-                mx.eval(to_sync)
-        elapsed = time.perf_counter() - start_time
-        stat = self._timing_stats[key]
-        stat[0] += elapsed
-        stat[1] += 1
-
-    def report_timing(self, reset: bool = False, prefix: str = "[Quest][Timing]"):
-        if not self._timing_stats:
-            return
-        print(prefix)
-        for key in sorted(self._timing_stats.keys()):
-            total, count = self._timing_stats[key]
-            avg = total / count if count else 0.0
-            print(f"  {key}: total {total:.3f}s, avg {avg*1000:.3f}ms, n={count}")
-        if reset:
-            self._timing_stats.clear()
-
     def on_detach(self):
-        if self.timing_enabled:
-            self.report_timing(prefix="[Quest][Timing][Summary]")
+        if self.timing.enabled:
+            self.timing.report(prefix="[Quest][Timing][Summary]")
+        self.timing.write_trace()
 
     def on_attach(self, engine):
         self.engine = engine
@@ -134,22 +111,24 @@ class QuestFeature(AlayaFeature):
                 dtype=mx.float16, # TODO: Match model dtype
                 async_disk_write=self.async_disk_write
             )
+            # Optional timing hook for fine-grained profiling.
+            self.controller._timing_hook = self.timing.record if self.timing.enabled else None
             print(f"[Quest] Controller Initialized: {self.page_budget} pages budget, disk cache at {self.cache_dir}")
-        
-        pass
+
 
     def forward_hook(self, attn_layer, x: mx.array, mask=None, cache=None):
         """
         The replacement forward function for Attention layers.
         """
         # 1. Projections
-        t_proj = time.perf_counter() if self.timing_enabled else None
+        t_proj = time.perf_counter() if self.timing.enabled else None
         q = attn_layer.q_proj(x)
         k = attn_layer.k_proj(x)
         v = attn_layer.v_proj(x)
         
         # Reshape to (B, L, H, D)
         B, L, _ = q.shape
+        phase = "prefill" if L > 1 else "decode"
         num_heads = attn_layer.n_heads if hasattr(attn_layer, "n_heads") else self.controller.num_heads
         # Check for GQA/MQA
         num_kv_heads = attn_layer.n_kv_heads if hasattr(attn_layer, "n_kv_heads") else num_heads
@@ -163,8 +142,8 @@ class QuestFeature(AlayaFeature):
             q = attn_layer.q_norm(q)
         if hasattr(attn_layer, "k_norm"):
             k = attn_layer.k_norm(k)
-        if self.timing_enabled:
-            self._record_timing("proj", t_proj, q, k, v)
+        if self.timing.enabled:
+            self.timing.record(f"{phase}_proj", t_proj, q, k, v)
         
         # 2. Quest Logic
         layer_idx = self.engine.layer_counter
@@ -176,10 +155,12 @@ class QuestFeature(AlayaFeature):
             self.controller.prepare_metadata(current_seq_len)
             # Setup indices
             self.controller.begin_forward(current_seq_len)
+            if phase == "prefill":
+                self._prefill_start = time.perf_counter()
 
         # 3. RoPE
         if hasattr(attn_layer, "rope"):
-            t_rope = time.perf_counter() if self.timing_enabled else None
+            t_rope = time.perf_counter() if self.timing.enabled else None
             # prepare_metadata increments seq_len by L (for the current batch)
             # So the correct starting offset for this batch is seq_len - L
             offset = self.controller.kv_cache.seq_len - L
@@ -190,8 +171,8 @@ class QuestFeature(AlayaFeature):
                  k = attn_layer.rope(k, offset=offset)
                  q = q.transpose(0, 2, 1, 3)
                  k = k.transpose(0, 2, 1, 3)
-            if self.timing_enabled:
-                self._record_timing("rope", t_rope, q, k)
+            if self.timing.enabled:
+                self.timing.record(f"{phase}_rope", t_rope, q, k)
             
         # 4. Append KV
         if B != 1:
@@ -202,10 +183,10 @@ class QuestFeature(AlayaFeature):
         q_in = q.squeeze(0)
         
         # Append (No repeat needed, ops handle GQA now)
-        t_append = time.perf_counter() if self.timing_enabled else None
+        t_append = time.perf_counter() if self.timing.enabled else None
         append_kv(k_in, v_in, self.controller, layer_idx)
-        if self.timing_enabled:
-            self._record_timing("append_kv", t_append)
+        if self.timing.enabled:
+            self.timing.record(f"{phase}_append_kv", t_append)
         
         # 5. Attention
         if L > 1:
@@ -226,12 +207,12 @@ class QuestFeature(AlayaFeature):
             # Causal mask: use built-in causal mode to avoid materializing an LxL mask.
             mask = "causal"
             
-            t_prefill = time.perf_counter() if self.timing_enabled else None
+            t_prefill = time.perf_counter() if self.timing.enabled else None
             out = mx.fast.scaled_dot_product_attention(
                 q_p, k_p, v_p, scale=1.0 / mx.sqrt(head_dim), mask=mask
             )
-            if self.timing_enabled:
-                self._record_timing("prefill_attn", t_prefill, out)
+            if self.timing.enabled:
+                self.timing.record("prefill_attn", t_prefill, out)
             
             # Output is (B, H, L, D) -> (B, L, H, D)
             out = out.transpose(0, 2, 1, 3)
@@ -246,11 +227,11 @@ class QuestFeature(AlayaFeature):
             # q_in: (1, H, D)
             need_estimate = self.controller.need_estimate()
             if need_estimate:
-                t_est = time.perf_counter() if self.timing_enabled else None
+                t_est = time.perf_counter() if self.timing.enabled else None
                 scores = decode_estimate(q_in, self.controller, layer_idx)
                 topk = decode_topk(scores, self.controller.inference_page_budget)
-                if self.timing_enabled:
-                    self._record_timing("decode_estimate_topk", t_est, topk)
+                if self.timing.enabled:
+                    self.timing.record("decode_estimate_topk", t_est, topk)
             else:
                 num_pages = len(self.controller.kv_indices_without_last)
                 base_indices = mx.arange(num_pages)[None, :]
@@ -261,10 +242,10 @@ class QuestFeature(AlayaFeature):
             # Transpose (L, H, D) to (H, L, D) then expand to (1, H, L, D)
             q_sdpa = mx.expand_dims(q_in.transpose(1, 0, 2), axis=0) 
             
-            t_sparse = time.perf_counter() if self.timing_enabled else None
+            t_sparse = time.perf_counter() if self.timing.enabled else None
             out_sdpa = decode_sparse_attn(q_sdpa, topk, self.controller, layer_idx)
-            if self.timing_enabled:
-                self._record_timing("decode_sparse_attn", t_sparse, out_sdpa)
+            if self.timing.enabled:
+                self.timing.record("decode_sparse_attn", t_sparse, out_sdpa)
             # out_sdpa: (1, H, 1, D)
             
             # Reshape to (B, L, H, D) -> (1, 1, H, D)
@@ -280,11 +261,19 @@ class QuestFeature(AlayaFeature):
 
         # 6. Output Projection
         # Reshape to (B, L, Hidden)
-        t_out = time.perf_counter() if self.timing_enabled else None
+        t_out = time.perf_counter() if self.timing.enabled else None
         out = out.reshape(B, L, -1)
         out = attn_layer.o_proj(out)
-        if self.timing_enabled:
-            self._record_timing("o_proj", t_out, out)
+        if self.timing.enabled:
+            self.timing.record(f"{phase}_o_proj", t_out, out)
+
+        if (
+            self._prefill_start is not None
+            and phase == "prefill"
+            and layer_idx == self.controller.num_layers - 1
+        ):
+            self.timing.record("prefill_total", self._prefill_start)
+            self._prefill_start = None
         
         # Manually increment layer counter since we bypassed the engine hook
         self.engine.layer_counter += 1

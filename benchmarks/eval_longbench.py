@@ -3,7 +3,7 @@ import json
 import time
 import os
 import mlx.core as mx
-from mlx_lm import load, generate
+from mlx_lm import load, generate, stream_generate
 from alayajet.engine import AlayaEngine
 
 # LongBench NarrativeQA Prompt Template
@@ -61,6 +61,12 @@ def main():
         action="store_false",
         help="Do not sync MLX ops (lower overhead, less accurate)"
     )
+    parser.add_argument(
+        "--quest-trace-output",
+        type=str,
+        default="",
+        help="Write Quest timing trace (e.g. timeline.svg or trace.json)"
+    )
     
     args = parser.parse_args()
     
@@ -91,7 +97,8 @@ def main():
             cache_dir=args.cache_dir,
             async_disk_write=True,
             timing=args.quest_timing,
-            timing_sync=args.quest_timing_sync
+            timing_sync=args.quest_timing_sync,
+            trace_output=args.quest_trace_output or None
         )
         
         from alayajet.features.chunking import ChunkComputationFeature
@@ -130,14 +137,38 @@ def main():
         prefill_step_size = 2048
         print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
         
-        prediction = generate(
-            model, 
-            tokenizer, 
-            prompt=prompt_formatted, 
-            max_tokens=args.max_tokens, 
-            verbose=False,
-            prefill_step_size=prefill_step_size
-        )
+        ttft = None
+        tpot = None
+        decode_time = None
+        if args.quest:
+            prediction = generate(
+                model,
+                tokenizer,
+                prompt=prompt_formatted,
+                max_tokens=args.max_tokens,
+                verbose=False,
+                prefill_step_size=prefill_step_size
+            )
+        else:
+            prediction = ""
+            last_response = None
+            for response in stream_generate(
+                model,
+                tokenizer,
+                prompt=prompt_formatted,
+                max_tokens=args.max_tokens,
+                prefill_step_size=prefill_step_size
+            ):
+                if ttft is None and response.prompt_tps:
+                    ttft = response.prompt_tokens / response.prompt_tps
+                last_response = response
+                prediction += response.text
+            if last_response and last_response.generation_tps:
+                tpot = 1.0 / last_response.generation_tps
+                if last_response.generation_tokens:
+                    decode_time = (
+                        last_response.generation_tokens / last_response.generation_tps
+                    )
         
         duration = time.time() - start_time
         prediction = prediction.strip()
@@ -145,6 +176,12 @@ def main():
         print(f"Question: {sample['input']}")
         print(f"Prediction: {prediction}")
         print(f"Ground Truth: {sample['answers']}")
+        if ttft is not None:
+            print(f"TTFT: {ttft:.2f}s")
+        if tpot is not None:
+            print(f"TPOT: {tpot*1000:.2f}ms")
+        if decode_time is not None:
+            print(f"Decode Time: {decode_time:.2f}s")
         print(f"Latency: {duration:.2f}s")
         
         results.append({
@@ -152,7 +189,10 @@ def main():
             "prediction": prediction,
             "answers": sample['answers'],
             "tokens": token_count,
-            "latency": duration
+            "latency": duration,
+            "ttft": ttft,
+            "tpot": tpot,
+            "decode_time": decode_time
         })
 
     # 3. Summary

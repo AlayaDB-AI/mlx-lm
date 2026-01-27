@@ -19,6 +19,7 @@ class DiskOffloadKvCache:
         max_seq_len: int,
         page_size: int,
         dtype=np.float32,
+        mx_dtype=mx.float16,
         cache_dir: str = "./kv_cache_tmp",
         name: str = "kv_cache",
         async_disk_write: bool = False
@@ -28,6 +29,7 @@ class DiskOffloadKvCache:
         self.head_dim = head_dim
         self.page_size = page_size
         self.dtype = dtype
+        self.mx_dtype = mx_dtype
         self.name = name
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
@@ -71,6 +73,8 @@ class DiskOffloadKvCache:
         # Active buffers in RAM: layer_idx -> np.array
         # These hold the current page being filled to avoid frequent small writes to disk
         self.active_buffers: Dict[int, np.ndarray] = {}
+        # Active buffers in MX: layer_idx -> mx.array (mirrors active_buffers)
+        self.active_buffers_mx: Dict[int, mx.array] = {}
         
         self.seq_len = 0
 
@@ -116,6 +120,10 @@ class DiskOffloadKvCache:
                         (2, self.page_size, self.num_heads, self.head_dim),
                         dtype=self.dtype
                     )
+                    self.active_buffers_mx[l] = mx.zeros(
+                        (2, self.page_size, self.num_heads, self.head_dim),
+                        dtype=self.mx_dtype
+                    )
             self.seq_len += 1
         return appended_page_count
     
@@ -126,6 +134,9 @@ class DiskOffloadKvCache:
             
     def get_active_buffer(self, layer_idx: int) -> np.ndarray:
         return self.active_buffers[layer_idx]
+
+    def get_active_buffer_mx(self, layer_idx: int) -> Optional[mx.array]:
+        return self.active_buffers_mx.get(layer_idx)
 
     def load_pages(self, layer_idx: int, page_indices: List[int]) -> mx.array:
         """
@@ -140,6 +151,19 @@ class DiskOffloadKvCache:
         pages_np = self.disk_pool[layer_idx, page_indices]
         return mx.array(pages_np)
 
+    def load_kv_slices(
+        self,
+        layer_idx: int,
+        physical_indices: np.ndarray,
+        kv_head_indices: np.ndarray,
+        timing_hook=None
+    ) -> np.ndarray:
+        """
+        Load KV slices for each (page_idx, kv_head_idx).
+        Returns numpy array of shape (H_q, k, 2, page_size, head_dim).
+        """
+        return self.disk_pool[layer_idx, physical_indices, :, :, kv_head_indices, :]
+
     def release(self):
         if self._disk_write_queue is not None:
             self._disk_write_queue.join()
@@ -148,6 +172,7 @@ class DiskOffloadKvCache:
         self.free_slots = set(range(self.capacity))
         self.active_indices.clear()
         self.active_buffers.clear()
+        self.active_buffers_mx.clear()
 
     def _write_disk_pool(self, layer_idx: int, page_idx: int, buffer_np: np.ndarray):
         if self._disk_write_queue is None:
@@ -194,8 +219,9 @@ class QuestController:
         self.dtype = dtype
         
         # Main KV Cache (Disk Backed)
-        # Note: Use float32 for disk cache to safely store float16 and bfloat16
-        np_dtype = np.float32
+        # Store in float16 when the model uses float16 to cut disk I/O in half.
+        # Keep float32 for other dtypes to avoid precision loss.
+        np_dtype = np.float16 if dtype == mx.float16 else np.float32
         
         self.kv_cache = DiskOffloadKvCache(
             num_layers=num_layers,
@@ -204,6 +230,7 @@ class QuestController:
             max_seq_len=max_seq_len,
             page_size=page_size,
             dtype=np_dtype,
+            mx_dtype=dtype,
             cache_dir=cache_dir,
             name="kv_cache",
             async_disk_write=async_disk_write

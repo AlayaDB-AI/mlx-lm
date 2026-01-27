@@ -88,7 +88,8 @@ class AlayaEngine:
         cache_dir: str = "./kv_quest_tmp",
         async_disk_write: bool = False,
         timing: bool = False,
-        timing_sync: bool = True
+        timing_sync: bool = True,
+        trace_output: str | None = None
     ):
         engine = cls()
         engine.add_feature(
@@ -97,7 +98,8 @@ class AlayaEngine:
                 cache_dir=cache_dir,
                 async_disk_write=async_disk_write,
                 timing=timing,
-                timing_sync=timing_sync
+                timing_sync=timing_sync,
+                trace_output=trace_output
             )
         )
         return engine
