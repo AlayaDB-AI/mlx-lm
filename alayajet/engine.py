@@ -89,7 +89,9 @@ class AlayaEngine:
         async_disk_write: bool = False,
         timing: bool = False,
         timing_sync: bool = True,
-        trace_output: str | None = None
+        trace_output: str | None = None,
+        trace_phase: str | None = None,
+        trace_decode_steps: int | None = 3,
     ):
         engine = cls()
         engine.add_feature(
@@ -99,7 +101,9 @@ class AlayaEngine:
                 async_disk_write=async_disk_write,
                 timing=timing,
                 timing_sync=timing_sync,
-                trace_output=trace_output
+                trace_output=trace_output,
+                trace_phase=trace_phase,
+                trace_decode_steps=trace_decode_steps,
             )
         )
         return engine

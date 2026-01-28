@@ -15,17 +15,26 @@ class QuestFeature(AlayaFeature):
         async_disk_write: bool = False,
         timing: bool = False,
         timing_sync: bool = True,
-        trace_output: str | None = None
+        trace_output: str | None = None,
+        trace_phase: str | None = None,
+        trace_decode_steps: int | None = 3,
     ):
         super().__init__()
         self.page_budget = page_budget
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
-        self.timing = QuestTiming(enabled=timing, sync=timing_sync, trace_output=trace_output)
+        self.timing = QuestTiming(
+            enabled=timing,
+            sync=timing_sync,
+            trace_output=trace_output,
+            trace_phase=trace_phase,
+            trace_decode_steps=trace_decode_steps,
+        )
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
         self._prefill_start = None
+        self._decode_step = 0
         
     def on_detach(self):
         if self.timing.enabled:
@@ -120,6 +129,16 @@ class QuestFeature(AlayaFeature):
         """
         The replacement forward function for Attention layers.
         """
+        B, L, _ = x.shape
+        phase = "prefill" if L > 1 else "decode"
+        layer_idx = self.engine.layer_counter
+        if layer_idx == 0:
+            if phase == "prefill":
+                self._decode_step = 0
+            self.timing.begin_step(phase, self._decode_step if phase == "decode" else None)
+            if phase == "decode":
+                self._decode_step += 1
+
         # 1. Projections
         t_proj = time.perf_counter() if self.timing.enabled else None
         q = attn_layer.q_proj(x)
@@ -127,8 +146,6 @@ class QuestFeature(AlayaFeature):
         v = attn_layer.v_proj(x)
         
         # Reshape to (B, L, H, D)
-        B, L, _ = q.shape
-        phase = "prefill" if L > 1 else "decode"
         num_heads = attn_layer.n_heads if hasattr(attn_layer, "n_heads") else self.controller.num_heads
         # Check for GQA/MQA
         num_kv_heads = attn_layer.n_kv_heads if hasattr(attn_layer, "n_kv_heads") else num_heads
@@ -146,8 +163,6 @@ class QuestFeature(AlayaFeature):
             self.timing.record(f"{phase}_proj", t_proj, q, k, v)
         
         # 2. Quest Logic
-        layer_idx = self.engine.layer_counter
-        
         if layer_idx == 0:
             # Start of a model forward pass
             current_seq_len = L

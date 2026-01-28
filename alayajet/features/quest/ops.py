@@ -217,21 +217,6 @@ def decode_sparse_attn(
     if timing_hook:
         timing_hook("decode_indices", t_indices)
     
-    # Pre-load last page (from active buffer)
-    if timing_hook:
-        t_last = time.perf_counter()
-    active_buffer = controller.kv_cache.get_active_buffer(layer_idx)
-    active_buffer_mx = controller.kv_cache.get_active_buffer_mx(layer_idx)
-    valid_len = controller.kv_cache.last_page_len
-    
-    # Active buffer is (2, page_size, H_kv, D)
-    if active_buffer_mx is not None:
-        last_k_mx = active_buffer_mx[0, :valid_len].astype(q.dtype)
-        last_v_mx = active_buffer_mx[1, :valid_len].astype(q.dtype)
-    else:
-        last_k_mx = mx.array(active_buffer[0, :valid_len]).astype(q.dtype) # (Len, H_kv, D)
-        last_v_mx = mx.array(active_buffer[1, :valid_len]).astype(q.dtype)
-    
     num_heads = q.shape[1] # H_q
     num_kv_heads = controller.kv_cache.num_heads # H_kv
     group_size = num_heads // num_kv_heads
@@ -269,6 +254,20 @@ def decode_sparse_attn(
         timing_hook("decode_disk_to_mx", t_disk_mx, k_disk_mx, v_disk_mx)
     
     # 2. Process Last Page (Active Buffer)
+    if timing_hook:
+        t_last = time.perf_counter()
+    active_buffer = controller.kv_cache.get_active_buffer(layer_idx)
+    active_buffer_mx = controller.kv_cache.get_active_buffer_mx(layer_idx)
+    valid_len = controller.kv_cache.last_page_len
+    
+    # Active buffer is (2, page_size, H_kv, D)
+    if active_buffer_mx is not None:
+        last_k_mx = active_buffer_mx[0, :valid_len].astype(q.dtype)
+        last_v_mx = active_buffer_mx[1, :valid_len].astype(q.dtype)
+    else:
+        last_k_mx = mx.array(active_buffer[0, :valid_len]).astype(q.dtype) # (Len, H_kv, D)
+        last_v_mx = mx.array(active_buffer[1, :valid_len]).astype(q.dtype)
+
     # last_k_mx: (Len, H_kv, D) -> (H_kv, Len, D)
     last_k_mx = last_k_mx.transpose(1, 0, 2)
     last_v_mx = last_v_mx.transpose(1, 0, 2)
