@@ -1,15 +1,232 @@
 import mlx.core as mx
 import numpy as np
 import os
-import shutil
 import queue
 import threading
-from typing import List, Optional, Set, Tuple, Dict
+from collections import OrderedDict
+from typing import List, Optional, Tuple, Dict
+
+try:
+    import fcntl
+except Exception:  # pragma: no cover - optional on some platforms
+    fcntl = None
+
+
+class BufferPool:
+    """
+    User-space buffer pool for head-sliced KV pages.
+    Each page is (2, page_size, head_dim) for a single KV head.
+    """
+    def __init__(
+        self,
+        backing_file: str,
+        num_layers: int,
+        capacity: int,
+        num_heads: int,
+        page_size: int,
+        head_dim: int,
+        dtype: np.dtype,
+        mx_dtype,
+        num_frames: int,
+        async_write: bool = False,
+        disable_os_cache: bool = True,
+    ):
+        self.backing_file = backing_file
+        self.num_layers = num_layers
+        self.capacity = capacity
+        self.num_heads = num_heads
+        self.page_size = page_size
+        self.head_dim = head_dim
+        self.dtype = np.dtype(dtype)
+        self.mx_dtype = mx_dtype
+        self.frame_shape = (2, page_size, head_dim)
+        self.page_bytes = int(np.prod(self.frame_shape) * self.dtype.itemsize)
+        self.total_pages = num_layers * capacity * num_heads
+        self.total_bytes = self.total_pages * self.page_bytes
+        self.num_frames = max(1, num_frames)
+
+        backing_dir = os.path.dirname(backing_file)
+        if backing_dir:
+            os.makedirs(backing_dir, exist_ok=True)
+        self.fd = os.open(backing_file, os.O_RDWR | os.O_CREAT)
+        os.ftruncate(self.fd, self.total_bytes)
+        if disable_os_cache and fcntl is not None:
+            try:
+                fcntl.fcntl(self.fd, fcntl.F_NOCACHE, 1)
+            except Exception:
+                pass
+
+        self.frames = [
+            np.empty(self.frame_shape, dtype=self.dtype)
+            for _ in range(self.num_frames)
+        ]
+        self.frame_dirty = [False] * self.num_frames
+        self.frame_page_id: List[Optional[Tuple[int, int, int]]] = [None] * self.num_frames
+        self.frame_mx_cache: List[Optional[mx.array]] = [None] * self.num_frames
+
+        self.page_table: Dict[Tuple[int, int, int], int] = {}
+        self.lru = OrderedDict()
+        self.free_list = list(range(self.num_frames))
+
+        self.read_bytes = 0
+        self.write_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+        self._write_queue: Optional[queue.Queue] = None
+        self._write_thread: Optional[threading.Thread] = None
+        self.async_write = async_write
+        if async_write:
+            self._write_queue = queue.Queue()
+            self._write_thread = threading.Thread(
+                target=self._write_worker,
+                daemon=True,
+            )
+            self._write_thread.start()
+
+    def _page_offset(self, page_id: Tuple[int, int, int]) -> int:
+        layer_idx, page_idx, kv_head = page_id
+        logical_index = (layer_idx * self.capacity + page_idx) * self.num_heads + kv_head
+        return logical_index * self.page_bytes
+
+    def _read_page(self, page_id: Tuple[int, int, int], frame: np.ndarray):
+        offset = self._page_offset(page_id)
+        data = os.pread(self.fd, self.page_bytes, offset)
+        if len(data) != self.page_bytes:
+            raise RuntimeError(
+                f"Short read for page {page_id}: {len(data)} != {self.page_bytes}"
+            )
+        frame_view = np.frombuffer(data, dtype=self.dtype).reshape(self.frame_shape)
+        frame[...] = frame_view
+        self.read_bytes += self.page_bytes
+
+    def _write_page(self, page_id: Tuple[int, int, int], frame: np.ndarray):
+        offset = self._page_offset(page_id)
+        written = os.pwrite(self.fd, frame, offset)
+        if written != self.page_bytes:
+            raise RuntimeError(
+                f"Short write for page {page_id}: {written} != {self.page_bytes}"
+            )
+        self.write_bytes += self.page_bytes
+
+    def _enqueue_write(self, page_id: Tuple[int, int, int], frame: np.ndarray):
+        if self._write_queue is None:
+            self._write_page(page_id, frame)
+            return
+        self._write_queue.put((page_id, np.array(frame, copy=True)))
+
+    def _write_worker(self):
+        if self._write_queue is None:
+            return
+        while True:
+            item = self._write_queue.get()
+            if item is None:
+                self._write_queue.task_done()
+                break
+            page_id, frame = item
+            self._write_page(page_id, frame)
+            self._write_queue.task_done()
+
+    def _evict_frame(self) -> int:
+        page_id, frame_idx = self.lru.popitem(last=False)
+        if self.frame_dirty[frame_idx]:
+            self._enqueue_write(page_id, self.frames[frame_idx])
+            self.frame_dirty[frame_idx] = False
+        del self.page_table[page_id]
+        self.frame_page_id[frame_idx] = None
+        self.frame_mx_cache[frame_idx] = None
+        return frame_idx
+
+    def _alloc_frame(self) -> int:
+        if self.free_list:
+            return self.free_list.pop()
+        return self._evict_frame()
+
+    def _touch(self, page_id: Tuple[int, int, int]):
+        if page_id in self.lru:
+            self.lru.move_to_end(page_id, last=True)
+
+    def _get_frame(self, page_id: Tuple[int, int, int], assume_zero: bool) -> int:
+        frame_idx = self.page_table.get(page_id)
+        if frame_idx is not None:
+            self.hits += 1
+            self._touch(page_id)
+            return frame_idx
+        self.misses += 1
+        frame_idx = self._alloc_frame()
+        self.page_table[page_id] = frame_idx
+        self.frame_page_id[frame_idx] = page_id
+        self.lru[page_id] = frame_idx
+        if assume_zero:
+            self.frames[frame_idx].fill(0)
+        else:
+            self._read_page(page_id, self.frames[frame_idx])
+        self.frame_mx_cache[frame_idx] = None
+        return frame_idx
+
+    def get_page(self, page_id: Tuple[int, int, int], assume_zero: bool = False) -> np.ndarray:
+        frame_idx = self._get_frame(page_id, assume_zero)
+        return self.frames[frame_idx]
+
+    def get_page_mx(self, page_id: Tuple[int, int, int], assume_zero: bool = False) -> mx.array:
+        frame_idx = self._get_frame(page_id, assume_zero)
+        cached = self.frame_mx_cache[frame_idx]
+        if cached is None:
+            cached = mx.array(self.frames[frame_idx]).astype(self.mx_dtype)
+            self.frame_mx_cache[frame_idx] = cached
+        return cached
+
+    def write_page(self, page_id: Tuple[int, int, int], data: np.ndarray):
+        frame_idx = self._get_frame(page_id, assume_zero=True)
+        self.frames[frame_idx][...] = data
+        self.frame_dirty[frame_idx] = True
+        self.frame_mx_cache[frame_idx] = None
+
+    def write_kv_slice(
+        self,
+        page_id: Tuple[int, int, int],
+        page_offset: int,
+        k_slice: np.ndarray,
+        v_slice: np.ndarray,
+        assume_zero: bool,
+    ):
+        frame_idx = self._get_frame(page_id, assume_zero=assume_zero)
+        end = page_offset + k_slice.shape[0]
+        frame = self.frames[frame_idx]
+        frame[0, page_offset:end] = k_slice
+        frame[1, page_offset:end] = v_slice
+        self.frame_dirty[frame_idx] = True
+        self.frame_mx_cache[frame_idx] = None
+
+    def flush(self):
+        for page_id, frame_idx in list(self.page_table.items()):
+            if self.frame_dirty[frame_idx]:
+                self._enqueue_write(page_id, self.frames[frame_idx])
+                self.frame_dirty[frame_idx] = False
+        if self._write_queue is not None:
+            self._write_queue.join()
+
+    def reset(self):
+        self.flush()
+        self.page_table.clear()
+        self.lru.clear()
+        self.free_list = list(range(self.num_frames))
+        self.frame_dirty = [False] * self.num_frames
+        self.frame_page_id = [None] * self.num_frames
+        self.frame_mx_cache = [None] * self.num_frames
+
+    def close(self):
+        self.flush()
+        if self._write_queue is not None:
+            self._write_queue.put(None)
+            self._write_queue.join()
+        os.close(self.fd)
+
 
 class DiskOffloadKvCache:
     """
-    Disk-offloaded KV Cache using numpy.memmap.
-    Stores pages in a monolithic file on disk, mapping them into memory as needed.
+    Disk-offloaded KV Cache using a user-space buffer pool.
+    Stores head-sliced pages in a monolithic file and caches them in RAM.
     """
     def __init__(
         self,
@@ -22,7 +239,9 @@ class DiskOffloadKvCache:
         mx_dtype=mx.float16,
         cache_dir: str = "./kv_cache_tmp",
         name: str = "kv_cache",
-        async_disk_write: bool = False
+        async_disk_write: bool = False,
+        buffer_pool_pages: Optional[int] = None,
+        disable_os_cache: bool = True,
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads # Stores num_kv_heads
@@ -44,25 +263,25 @@ class DiskOffloadKvCache:
         # Determine shape: (num_layers, capacity, 2, page_size, num_heads, head_dim)
         # 2 represents Key and Value
         self.shape = (num_layers, self.capacity, 2, page_size, num_heads, head_dim)
-        
-        # Initialize memmap
-        # mode='w+' creates or overwrites the file
-        self.disk_pool = np.memmap(
-            self.backing_file,
-            dtype=self.dtype,
-            mode='w+',
-            shape=self.shape
-        )
 
-        self._disk_write_queue: Optional[queue.Queue] = None
-        self._disk_write_thread: Optional[threading.Thread] = None
-        if self.async_disk_write:
-            self._disk_write_queue = queue.Queue()
-            self._disk_write_thread = threading.Thread(
-                target=self._disk_write_worker,
-                daemon=True
-            )
-            self._disk_write_thread.start()
+        if buffer_pool_pages is None:
+            buffer_pool_pages = min(self.capacity, 64)
+        buffer_pool_pages = max(1, min(buffer_pool_pages, self.capacity))
+        self.buffer_pool_pages = buffer_pool_pages
+        num_frames = num_layers * buffer_pool_pages * num_heads
+        self.buffer_pool = BufferPool(
+            backing_file=self.backing_file,
+            num_layers=num_layers,
+            capacity=self.capacity,
+            num_heads=num_heads,
+            page_size=page_size,
+            head_dim=head_dim,
+            dtype=self.dtype,
+            mx_dtype=self.mx_dtype,
+            num_frames=num_frames,
+            async_write=self.async_disk_write,
+            disable_os_cache=disable_os_cache,
+        )
         
         # Track free blocks (simple stack allocator)
         self.free_slots = set(range(self.capacity))
@@ -70,10 +289,7 @@ class DiskOffloadKvCache:
         # Active page indices (ordered list of pages used by the sequence)
         self.active_indices: List[int] = []
         
-        # Active buffers in RAM: layer_idx -> np.array
-        # These hold the current page being filled to avoid frequent small writes to disk
-        self.active_buffers: Dict[int, np.ndarray] = {}
-        # Active buffers in MX: layer_idx -> mx.array (mirrors active_buffers)
+        # Active buffers in MX: layer_idx -> mx.array
         self.active_buffers_mx: Dict[int, mx.array] = {}
         
         self.seq_len = 0
@@ -113,13 +329,9 @@ class DiskOffloadKvCache:
                 self.active_indices.append(new_idx)
                 appended_page_count += 1
                 
-                # Initialize active buffers for all layers
+                # Initialize active buffers for all layers (MX only).
                 for l in range(self.num_layers):
                     # Shape: (2, page_size, num_heads, head_dim)
-                    self.active_buffers[l] = np.zeros(
-                        (2, self.page_size, self.num_heads, self.head_dim),
-                        dtype=self.dtype
-                    )
                     self.active_buffers_mx[l] = mx.zeros(
                         (2, self.page_size, self.num_heads, self.head_dim),
                         dtype=self.mx_dtype
@@ -128,27 +340,39 @@ class DiskOffloadKvCache:
         return appended_page_count
     
     def flush_active_buffers(self, page_idx: int):
-        """Writes active buffers to disk pool."""
-        for l, buffer in self.active_buffers.items():
-            self._write_disk_pool(l, page_idx, buffer)
-            
-    def get_active_buffer(self, layer_idx: int) -> np.ndarray:
-        return self.active_buffers[layer_idx]
+        """Writes active buffers to buffer pool."""
+        for l, buffer_mx in self.active_buffers_mx.items():
+            buffer_np = np.array(buffer_mx)
+            if buffer_np.dtype != self.dtype:
+                buffer_np = buffer_np.astype(self.dtype, copy=False)
+            for kv_head in range(self.num_heads):
+                page_id = (l, page_idx, kv_head)
+                head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
+                self.buffer_pool.write_page(page_id, head_slice)
+
+    def get_active_buffer(self, layer_idx: int) -> Optional[np.ndarray]:
+        return None
 
     def get_active_buffer_mx(self, layer_idx: int) -> Optional[mx.array]:
         return self.active_buffers_mx.get(layer_idx)
 
     def load_pages(self, layer_idx: int, page_indices: List[int]) -> mx.array:
         """
-        Load multiple pages from disk pool.
+        Load multiple pages from buffer pool.
         Returns mx.array of shape (num_pages, 2, page_size, num_heads, head_dim)
         """
         if not page_indices:
             return mx.array([])
-            
-        # Convert indices to list for slicing if not already
-        # numpy fancy indexing
-        pages_np = self.disk_pool[layer_idx, page_indices]
+        pages = []
+        for page_idx in page_indices:
+            heads = []
+            for kv_head in range(self.num_heads):
+                page_id = (layer_idx, page_idx, kv_head)
+                head_page = self.buffer_pool.get_page(page_id)
+                heads.append(head_page)
+            page = np.stack(heads, axis=2)
+            pages.append(page)
+        pages_np = np.stack(pages, axis=0)
         return mx.array(pages_np)
 
     def load_kv_slices(
@@ -162,35 +386,84 @@ class DiskOffloadKvCache:
         Load KV slices for each (page_idx, kv_head_idx).
         Returns numpy array of shape (H_q, k, 2, page_size, head_dim).
         """
-        return self.disk_pool[layer_idx, physical_indices, :, :, kv_head_indices, :]
+        num_heads, k = physical_indices.shape
+        if physical_indices.size == 0:
+            return np.zeros(
+                (num_heads, 0, 2, self.page_size, self.head_dim),
+                dtype=self.dtype,
+            )
+        pages_np = np.empty(
+            (num_heads, k, 2, self.page_size, self.head_dim),
+            dtype=self.dtype,
+        )
+        for h in range(num_heads):
+            kv_head = int(kv_head_indices[h, 0])
+            for j in range(k):
+                page_idx = int(physical_indices[h, j])
+                page_id = (layer_idx, page_idx, kv_head)
+                pages_np[h, j] = self.buffer_pool.get_page(page_id)
+        return pages_np
+
+    def load_kv_slices_mx(
+        self,
+        layer_idx: int,
+        physical_indices: np.ndarray,
+        kv_head_indices: np.ndarray,
+        dtype,
+    ) -> Tuple[mx.array, mx.array]:
+        num_heads, k = physical_indices.shape
+        if physical_indices.size == 0:
+            empty = mx.zeros((num_heads, 0, self.head_dim), dtype=dtype)
+            return empty, empty
+        pages = []
+        for h in range(num_heads):
+            kv_head = int(kv_head_indices[h, 0])
+            for j in range(k):
+                page_idx = int(physical_indices[h, j])
+                page_id = (layer_idx, page_idx, kv_head)
+                pages.append(self.buffer_pool.get_page_mx(page_id))
+        pages_mx = mx.stack(pages, axis=0)
+        if pages_mx.dtype != dtype:
+            pages_mx = pages_mx.astype(dtype)
+        pages_mx = pages_mx.reshape(
+            num_heads,
+            k,
+            2,
+            self.page_size,
+            self.head_dim,
+        )
+        k_disk = pages_mx[:, :, 0].reshape(num_heads, -1, self.head_dim)
+        v_disk = pages_mx[:, :, 1].reshape(num_heads, -1, self.head_dim)
+        return k_disk, v_disk
+
+    def write_kv_slice(
+        self,
+        layer_idx: int,
+        page_idx: int,
+        page_offset: int,
+        k_np: np.ndarray,
+        v_np: np.ndarray,
+        assume_zero: bool,
+    ):
+        for kv_head in range(self.num_heads):
+            page_id = (layer_idx, page_idx, kv_head)
+            k_slice = k_np[:, kv_head, :]
+            v_slice = v_np[:, kv_head, :]
+            self.buffer_pool.write_kv_slice(
+                page_id=page_id,
+                page_offset=page_offset,
+                k_slice=k_slice,
+                v_slice=v_slice,
+                assume_zero=assume_zero,
+            )
 
     def release(self):
-        if self._disk_write_queue is not None:
-            self._disk_write_queue.join()
+        self.buffer_pool.reset()
         self.seq_len = 0
         # Reset free slots
         self.free_slots = set(range(self.capacity))
         self.active_indices.clear()
-        self.active_buffers.clear()
         self.active_buffers_mx.clear()
-
-    def _write_disk_pool(self, layer_idx: int, page_idx: int, buffer_np: np.ndarray):
-        if self._disk_write_queue is None:
-            self.disk_pool[layer_idx, page_idx] = buffer_np
-            return
-        self._disk_write_queue.put((layer_idx, page_idx, buffer_np))
-
-    def _disk_write_worker(self):
-        if self._disk_write_queue is None:
-            return
-        while True:
-            item = self._disk_write_queue.get()
-            if item is None:
-                self._disk_write_queue.task_done()
-                break
-            layer_idx, page_idx, buffer_np = item
-            self.disk_pool[layer_idx, page_idx] = buffer_np
-            self._disk_write_queue.task_done()
 
 
 class QuestController:
@@ -208,7 +481,9 @@ class QuestController:
         num_kv_heads: Optional[int] = None, # Added parameter
         dtype=mx.float16,
         cache_dir: str = "./kv_cache_tmp",
-        async_disk_write: bool = False
+        async_disk_write: bool = False,
+        buffer_pool_pages: Optional[int] = None,
+        disable_os_cache: bool = True,
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -217,6 +492,10 @@ class QuestController:
         self.page_size = page_size
         self._page_budget = page_budget
         self.dtype = dtype
+        if buffer_pool_pages is None:
+            group_size = max(1, self.num_heads // self.num_kv_heads)
+            buffer_pool_pages = page_budget * group_size
+        buffer_pool_pages = max(1, buffer_pool_pages)
         
         # Main KV Cache (Disk Backed)
         # Store in float16 when the model uses float16 to cut disk I/O in half.
@@ -233,7 +512,9 @@ class QuestController:
             mx_dtype=dtype,
             cache_dir=cache_dir,
             name="kv_cache",
-            async_disk_write=async_disk_write
+            async_disk_write=async_disk_write,
+            buffer_pool_pages=buffer_pool_pages,
+            disable_os_cache=disable_os_cache,
         )
         
         # Metadata Cache (RAM)

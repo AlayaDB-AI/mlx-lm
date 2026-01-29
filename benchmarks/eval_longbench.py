@@ -17,11 +17,22 @@ PROMPT_TEMPLATE = (
 
 def load_jsonl(file_path, num_samples):
     samples = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            if i >= num_samples:
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if len(samples) >= num_samples:
                 break
-            samples.append(json.loads(line))
+            if not line.strip():
+                continue
+            try:
+                samples.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                preview = line[:120].rstrip("\n")
+                raise RuntimeError(
+                    f"Failed to parse JSONL at {file_path}:{line_no}. "
+                    f"First line preview: {preview!r}. "
+                    "This usually means the file is not the expected LongBench *.jsonl "
+                    "(e.g. it contains an error page like 'Entry not found')."
+                ) from e
     return samples
 
 def main():
@@ -67,6 +78,12 @@ def main():
         default="",
         help="Write Quest timing trace (e.g. timeline.svg or trace.json)"
     )
+    parser.add_argument(
+        "--quest-trace-decode-steps",
+        type=int,
+        default=3,
+        help="Number of decode steps to include in Quest trace (<=0 disables decode tracing)"
+    )
     
     args = parser.parse_args()
     
@@ -98,7 +115,8 @@ def main():
             async_disk_write=True,
             timing=args.quest_timing,
             timing_sync=args.quest_timing_sync,
-            trace_output=args.quest_trace_output or None
+            trace_output=args.quest_trace_output or None,
+            trace_decode_steps=args.quest_trace_decode_steps,
         )
         
         from alayajet.features.chunking import ChunkComputationFeature
@@ -134,7 +152,7 @@ def main():
         start_time = time.time()
         
         # Generation
-        prefill_step_size = 2048
+        prefill_step_size = 40000
         print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
         
         ttft = None

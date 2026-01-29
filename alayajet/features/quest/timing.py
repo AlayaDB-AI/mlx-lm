@@ -36,10 +36,8 @@ class QuestTiming:
             "decode_sparse_attn",
             "decode_indices",
             "decode_disk_read",
-            "decode_disk_to_mx",
             "decode_last_page",
-            "decode_concat",
-            "decode_sdpa",
+            "decode_stream_attn",
         }
         self._trace_hidden_keys = {
             "decode_sparse_attn",
@@ -123,10 +121,8 @@ class QuestTiming:
             for key in (
                 "decode_indices",
                 "decode_disk_read",
-                "decode_disk_to_mx",
                 "decode_last_page",
-                "decode_concat",
-                "decode_sdpa",
+                "decode_stream_attn",
             ):
                 fmt_line(key, denom=decode_total)
 
@@ -166,10 +162,8 @@ class QuestTiming:
                 "decode_sparse_attn",
                 "decode_indices",
                 "decode_disk_read",
-                "decode_disk_to_mx",
                 "decode_last_page",
-                "decode_concat",
-                "decode_sdpa",
+                "decode_stream_attn",
             ]
         elif self.trace_phase == "prefill":
             preferred = []

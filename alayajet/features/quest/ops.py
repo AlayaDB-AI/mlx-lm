@@ -48,28 +48,19 @@ def append_kv(
         v_chunk = v[current_offset_in_input : current_offset_in_input + tokens_to_write]
         
         k_chunk_f32 = k_chunk.astype(mx.float32)
-        v_chunk_f32 = v_chunk.astype(mx.float32)
+        chunk_k_min = np.array(mx.min(k_chunk_f32, axis=0))
+        chunk_k_max = np.array(mx.max(k_chunk_f32, axis=0))
         
         is_last_page = (page_idx == len(controller.kv_cache.active_indices) - 1)
         
         if is_last_page:
-            buffer = controller.kv_cache.get_active_buffer(layer_idx)
             buffer_mx = controller.kv_cache.get_active_buffer_mx(layer_idx)
-            # buffer shape: (2, page_size, H_kv, D)
-            k_np = np.array(k_chunk_f32)
-            v_np = np.array(v_chunk_f32)
-            k_np_disk = k_np.astype(buffer.dtype, copy=False)
-            v_np_disk = v_np.astype(buffer.dtype, copy=False)
-            buffer[0, page_offset : page_offset + tokens_to_write] = k_np_disk
-            buffer[1, page_offset : page_offset + tokens_to_write] = v_np_disk
-            if buffer_mx is not None:
-                buffer_mx[0, page_offset : page_offset + tokens_to_write] = k_chunk.astype(buffer_mx.dtype)
-                buffer_mx[1, page_offset : page_offset + tokens_to_write] = v_chunk.astype(buffer_mx.dtype)
+            if buffer_mx is None:
+                raise RuntimeError("Active MX buffer missing for last page.")
+            buffer_mx[0, page_offset : page_offset + tokens_to_write] = k_chunk.astype(buffer_mx.dtype)
+            buffer_mx[1, page_offset : page_offset + tokens_to_write] = v_chunk.astype(buffer_mx.dtype)
             
             # Update Metadata incrementally to avoid rescanning the active page.
-            chunk_k_min = np.min(k_np, axis=0)
-            chunk_k_max = np.max(k_np, axis=0)
-            
             # Use physical index for metadata
             phys_page_idx = controller.kv_cache.active_indices[page_idx]
             if page_offset == 0:
@@ -84,21 +75,24 @@ def append_kv(
         else:
             physical_block_idx = controller.kv_cache.active_indices[page_idx]
             
-            # Write K
-            k_np = np.array(k_chunk_f32)
-            k_np_disk = k_np.astype(controller.kv_cache.disk_pool.dtype, copy=False)
-            controller.kv_cache.disk_pool[layer_idx, physical_block_idx, 0, page_offset : page_offset + tokens_to_write] = k_np_disk
-            # Write V
-            v_np = np.array(v_chunk_f32)
-            v_np_disk = v_np.astype(controller.kv_cache.disk_pool.dtype, copy=False)
-            controller.kv_cache.disk_pool[layer_idx, physical_block_idx, 1, page_offset : page_offset + tokens_to_write] = v_np_disk
+            k_np = np.array(k_chunk)
+            v_np = np.array(v_chunk)
+            if k_np.dtype != controller.kv_cache.dtype:
+                k_np = k_np.astype(controller.kv_cache.dtype, copy=False)
+            if v_np.dtype != controller.kv_cache.dtype:
+                v_np = v_np.astype(controller.kv_cache.dtype, copy=False)
+            controller.kv_cache.write_kv_slice(
+                layer_idx=layer_idx,
+                page_idx=physical_block_idx,
+                page_offset=page_offset,
+                k_np=k_np,
+                v_np=v_np,
+                assume_zero=(page_offset == 0),
+            )
             
             # Metadata update for disk page
             # Update metadata even for partial writes to non-last pages
             # (e.g. filling the tail of a page that just became full)
-            
-            chunk_k_min = np.min(k_np, axis=0)
-            chunk_k_max = np.max(k_np, axis=0)
             
             if page_offset == 0:
                 # First write to this page (or full overwrite), set metadata directly
@@ -227,46 +221,26 @@ def decode_sparse_attn(
     if timing_hook:
         t_disk = time.perf_counter()
     kv_head_indices = (np.arange(num_heads, dtype=np.int64) // group_size)[:, None]
-    pages_np = controller.kv_cache.load_kv_slices(
+    k_disk_mx, v_disk_mx = controller.kv_cache.load_kv_slices_mx(
         layer_idx,
         physical_indices,
         kv_head_indices,
-        timing_hook=timing_hook
+        dtype=q.dtype,
     )
     if timing_hook:
         timing_hook("decode_disk_read", t_disk)
     
-    # Separate K/V and Flatten
-    # pages_np: (H_q, k, 2, PageSize, D)
-    k_pages = pages_np[:, :, 0, :, :] # (H_q, k, PageSize, D)
-    v_pages = pages_np[:, :, 1, :, :]
-    
-    # Reshape to (H_q, TotalDiskLen, D)
-    k_disk = k_pages.reshape(num_heads, -1, controller.head_dim)
-    v_disk = v_pages.reshape(num_heads, -1, controller.head_dim)
-    
-    # Convert to MLX
-    if timing_hook:
-        t_disk_mx = time.perf_counter()
-    k_disk_mx = mx.array(k_disk).astype(q.dtype)
-    v_disk_mx = mx.array(v_disk).astype(q.dtype)
-    if timing_hook:
-        timing_hook("decode_disk_to_mx", t_disk_mx, k_disk_mx, v_disk_mx)
-    
     # 2. Process Last Page (Active Buffer)
     if timing_hook:
         t_last = time.perf_counter()
-    active_buffer = controller.kv_cache.get_active_buffer(layer_idx)
     active_buffer_mx = controller.kv_cache.get_active_buffer_mx(layer_idx)
     valid_len = controller.kv_cache.last_page_len
     
     # Active buffer is (2, page_size, H_kv, D)
-    if active_buffer_mx is not None:
-        last_k_mx = active_buffer_mx[0, :valid_len].astype(q.dtype)
-        last_v_mx = active_buffer_mx[1, :valid_len].astype(q.dtype)
-    else:
-        last_k_mx = mx.array(active_buffer[0, :valid_len]).astype(q.dtype) # (Len, H_kv, D)
-        last_v_mx = mx.array(active_buffer[1, :valid_len]).astype(q.dtype)
+    if active_buffer_mx is None:
+        raise RuntimeError("Active MX buffer missing during decode.")
+    last_k_mx = active_buffer_mx[0, :valid_len].astype(q.dtype)
+    last_v_mx = active_buffer_mx[1, :valid_len].astype(q.dtype)
 
     # last_k_mx: (Len, H_kv, D) -> (H_kv, Len, D)
     last_k_mx = last_k_mx.transpose(1, 0, 2)
@@ -279,26 +253,58 @@ def decode_sparse_attn(
     if timing_hook:
         timing_hook("decode_last_page", t_last, last_k_mx, last_v_mx)
     
-    # 3. Concatenate
-    # k_disk_mx: (H_q, DiskLen, D)
-    # last_k_mx: (H_q, ActiveLen, D)
-    
+    # 3. Streaming Attention (log-sum-exp over blocks)
     if timing_hook:
-        t_concat = time.perf_counter()
-    K = mx.concatenate([k_disk_mx, last_k_mx], axis=1) # (H_q, TotalLen, D)
-    V = mx.concatenate([v_disk_mx, last_v_mx], axis=1)
-    
-    # Add Batch Dim -> (1, H_q, TotalLen, D)
-    K = mx.expand_dims(K, axis=0)
-    V = mx.expand_dims(V, axis=0)
+        t_stream = time.perf_counter()
+    scale = 1.0 / mx.sqrt(q.shape[-1])
+    q_vec = q[0, :, 0, :] * scale
+
+    def stream_update(m_prev, l_prev, o_prev, k_block, v_block):
+        scores = mx.matmul(q_vec[:, None, :], k_block.transpose(0, 2, 1))[:, 0, :]
+        m_block = mx.max(scores, axis=-1, keepdims=True)
+        p = mx.exp(scores - m_block)
+        l_block = mx.sum(p, axis=-1, keepdims=True)
+        o_block = mx.matmul(p[:, None, :], v_block)[:, 0, :]
+        if m_prev is None:
+            return m_block, l_block, o_block
+        m_new = mx.maximum(m_prev, m_block)
+        l_new = l_prev * mx.exp(m_prev - m_new) + l_block * mx.exp(m_block - m_new)
+        o_new = o_prev * mx.exp(m_prev - m_new) + o_block * mx.exp(m_block - m_new)
+        return m_new, l_new, o_new
+
+    m = None
+    l = None
+    o = None
+
+    disk_len = k_disk_mx.shape[1]
+    if disk_len > 0:
+        page_size = controller.page_size
+        num_pages = disk_len // page_size
+        if num_pages > 0:
+            block_pages = min(8, num_pages)
+            for start_page in range(0, num_pages, block_pages):
+                end_page = min(num_pages, start_page + block_pages)
+                start_idx = start_page * page_size
+                end_idx = end_page * page_size
+                k_block = k_disk_mx[:, start_idx:end_idx, :]
+                v_block = v_disk_mx[:, start_idx:end_idx, :]
+                m, l, o = stream_update(m, l, o, k_block, v_block)
+        tail = disk_len - (num_pages * page_size)
+        if tail > 0:
+            k_tail = k_disk_mx[:, -tail:, :]
+            v_tail = v_disk_mx[:, -tail:, :]
+            m, l, o = stream_update(m, l, o, k_tail, v_tail)
+
+    if valid_len > 0:
+        m, l, o = stream_update(m, l, o, last_k_mx, last_v_mx)
+
+    if o is None:
+        out = mx.zeros_like(q)
+    else:
+        out_heads = o / l
+        out = mx.expand_dims(mx.expand_dims(out_heads, axis=1), axis=0)
+
     if timing_hook:
-        timing_hook("decode_concat", t_concat, K, V)
-    
-    # Attention
-    if timing_hook:
-        t_sdpa = time.perf_counter()
-    out = mx.fast.scaled_dot_product_attention(q, K, V, scale=1.0/mx.sqrt(q.shape[-1]))
-    if timing_hook:
-        timing_hook("decode_sdpa", t_sdpa, out)
-    
+        timing_hook("decode_stream_attn", t_stream, out)
+
     return out
