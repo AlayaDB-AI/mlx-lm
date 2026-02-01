@@ -44,6 +44,7 @@ def main():
     parser.add_argument("--data-path", type=str, default="benchmarks/data/LongBench/narrativeqa.jsonl", help="Path to narrativeqa.jsonl")
     parser.add_argument("--cache-dir", type=str, default="./kv_cache_eval", help="Quest cache directory")
     parser.add_argument("--max-tokens", type=int, default=32, help="Max tokens for generation")
+    parser.add_argument("--prompt-repeat", type=int, default=1, help="Repeat each prompt N times to extend context")
     parser.add_argument("--timing", action="store_true", help="Enable baseline timing breakdown")
     parser.add_argument(
         "--timing-sync",
@@ -138,6 +139,8 @@ def main():
         print(f"\n[{idx+1}/{args.num_samples}] Task: {sample.get('dataset', 'narrativeqa')}")
         
         prompt = PROMPT_TEMPLATE.format(context=sample['context'], input=sample['input'])
+        if args.prompt_repeat > 1:
+            prompt = "\n\n".join([prompt] * args.prompt_repeat)
         
         # Qwen Chat Template
         if hasattr(tokenizer, "apply_chat_template"):
@@ -152,41 +155,31 @@ def main():
         start_time = time.time()
         
         # Generation
-        prefill_step_size = 40000
+        prefill_step_size = 70000
         print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
         
         ttft = None
         tpot = None
         decode_time = None
-        if args.quest:
-            prediction = generate(
-                model,
-                tokenizer,
-                prompt=prompt_formatted,
-                max_tokens=args.max_tokens,
-                verbose=False,
-                prefill_step_size=prefill_step_size
-            )
-        else:
-            prediction = ""
-            last_response = None
-            for response in stream_generate(
-                model,
-                tokenizer,
-                prompt=prompt_formatted,
-                max_tokens=args.max_tokens,
-                prefill_step_size=prefill_step_size
-            ):
-                if ttft is None and response.prompt_tps:
-                    ttft = response.prompt_tokens / response.prompt_tps
-                last_response = response
-                prediction += response.text
-            if last_response and last_response.generation_tps:
-                tpot = 1.0 / last_response.generation_tps
-                if last_response.generation_tokens:
-                    decode_time = (
-                        last_response.generation_tokens / last_response.generation_tps
-                    )
+        prediction = ""
+        last_response = None
+        for response in stream_generate(
+            model,
+            tokenizer,
+            prompt=prompt_formatted,
+            max_tokens=args.max_tokens,
+            prefill_step_size=prefill_step_size,
+        ):
+            if ttft is None and response.prompt_tps:
+                ttft = response.prompt_tokens / response.prompt_tps
+            last_response = response
+            prediction += response.text
+        if last_response and last_response.generation_tps:
+            tpot = 1.0 / last_response.generation_tps
+            if last_response.generation_tokens:
+                decode_time = (
+                    last_response.generation_tokens / last_response.generation_tps
+                )
         
         duration = time.time() - start_time
         prediction = prediction.strip()

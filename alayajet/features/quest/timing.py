@@ -154,7 +154,9 @@ class QuestTiming:
                     filtered.append(e)
         return filtered
 
-    def _trace_row_order(self, names):
+    def _trace_row_order(self, names, first_ts=None):
+        if first_ts:
+            return sorted(names, key=lambda name: (first_ts.get(name, 0.0), name))
         if self.trace_phase == "decode":
             preferred = [
                 "decode_append_kv",
@@ -227,7 +229,13 @@ class QuestTiming:
             return
 
         names = sorted({e["name"] for e in events})
-        row_order = self._trace_row_order(names)
+        first_ts = {}
+        for e in events:
+            name = e["name"]
+            ts = e["ts"]
+            if name not in first_ts or ts < first_ts[name]:
+                first_ts[name] = ts
+        row_order = self._trace_row_order(names, first_ts=first_ts)
         name_to_row = {name: idx for idx, name in enumerate(row_order)}
         row_height = 18
         row_gap = 6
@@ -236,11 +244,10 @@ class QuestTiming:
         base_width = 1400
         char_width = 7
         max_label_len = max((len(name) for name in row_order), default=0)
-        legend_width = max(180, 40 + max_label_len * char_width)
-        plot_width = base_width - left_margin - legend_width - 20
+        plot_width = base_width - left_margin - 20
         if plot_width < 600:
             plot_width = 600
-            width = left_margin + plot_width + legend_width + 20
+            width = left_margin + plot_width + 20
         else:
             width = base_width
         height = top_margin + (row_height + row_gap) * len(row_order) + 20
@@ -272,26 +279,6 @@ class QuestTiming:
                 f'<rect x="{x:.2f}" y="{y}" width="{w:.2f}" height="{row_height}" '
                 f'fill="{color_for(name)}" opacity="0.8" />'
             )
-
-        legend_x = width - legend_width + 10
-        legend_box_x = width - legend_width + 4
-        legend_y = 20
-        legend_item_h = 16
-        legend_height = legend_item_h * len(row_order) + 12
-        lines.append(
-            f'<rect x="{legend_box_x}" y="{legend_y - 10}" '
-            f'width="{legend_width - 8}" height="{legend_height}" '
-            f'fill="#ffffff" stroke="#cccccc" />'
-        )
-        lines.append(f'<text x="{legend_x}" y="{legend_y}">Legend</text>')
-        for idx, name in enumerate(row_order):
-            y = legend_y + 8 + (idx + 1) * legend_item_h
-            color = color_for(name)
-            lines.append(
-                f'<rect x="{legend_x}" y="{y - 10}" width="12" height="12" '
-                f'fill="{color}" opacity="0.8" />'
-            )
-            lines.append(f'<text x="{legend_x + 18}" y="{y}">{name}</text>')
 
         lines.append("</svg>")
         with open(path, "w", encoding="utf-8") as f:
