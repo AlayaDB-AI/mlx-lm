@@ -18,6 +18,8 @@ class QuestFeature(AlayaFeature):
         trace_output: str | None = None,
         trace_phase: str | None = None,
         trace_decode_steps: int | None = 3,
+        release_active_buffer_on_prefill: bool = True,
+        log_prefill_layer_timing: bool = False,
     ):
         super().__init__()
         self.page_budget = page_budget
@@ -30,6 +32,8 @@ class QuestFeature(AlayaFeature):
             trace_phase=trace_phase,
             trace_decode_steps=trace_decode_steps,
         )
+        self.release_active_buffer_on_prefill = release_active_buffer_on_prefill
+        self.log_prefill_layer_timing = log_prefill_layer_timing
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
@@ -118,7 +122,8 @@ class QuestFeature(AlayaFeature):
                 num_kv_heads=num_kv_heads,
                 cache_dir=self.cache_dir,
                 dtype=mx.float16, # TODO: Match model dtype
-                async_disk_write=self.async_disk_write
+                async_disk_write=self.async_disk_write,
+                release_active_buffer_on_prefill=self.release_active_buffer_on_prefill,
             )
             # Optional timing hook for fine-grained profiling.
             self.controller._timing_hook = self.timing.record if self.timing.enabled else None
@@ -131,6 +136,7 @@ class QuestFeature(AlayaFeature):
         """
         B, L, _ = x.shape
         phase = "prefill" if L > 1 else "decode"
+        layer_t0 = time.perf_counter() if self.log_prefill_layer_timing and phase == "prefill" else None
         layer_idx = self.engine.layer_counter
         if layer_idx == 0:
             if phase == "prefill":
@@ -289,6 +295,12 @@ class QuestFeature(AlayaFeature):
         ):
             self.timing.record("prefill_total", self._prefill_start)
             self._prefill_start = None
+
+        if phase == "prefill" and self.release_active_buffer_on_prefill:
+            self.controller.kv_cache.offload_active_buffer(layer_idx)
+        if layer_t0 is not None:
+            elapsed = (time.perf_counter() - layer_t0) * 1000.0
+            print(f"[Quest][Prefill] Layer {layer_idx:02d} | L={L} | {elapsed:.2f} ms")
         
         # Manually increment layer counter since we bypassed the engine hook
         self.engine.layer_counter += 1

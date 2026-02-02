@@ -92,6 +92,8 @@ class AlayaEngine:
         trace_output: str | None = None,
         trace_phase: str | None = None,
         trace_decode_steps: int | None = 3,
+        release_active_buffer_on_prefill: bool = True,
+        log_prefill_layer_timing: bool = False,
     ):
         engine = cls()
         engine.add_feature(
@@ -104,6 +106,8 @@ class AlayaEngine:
                 trace_output=trace_output,
                 trace_phase=trace_phase,
                 trace_decode_steps=trace_decode_steps,
+                release_active_buffer_on_prefill=release_active_buffer_on_prefill,
+                log_prefill_layer_timing=log_prefill_layer_timing,
             )
         )
         return engine

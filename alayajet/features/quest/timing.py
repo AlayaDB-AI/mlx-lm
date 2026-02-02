@@ -1,5 +1,8 @@
 import json
 import os
+import shutil
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from typing import Optional
@@ -30,6 +33,7 @@ class QuestTiming:
         self._trace_tid_map = {}
         self._trace_next_tid = 0
         self._trace_allow = True
+        self._trace_step_ts = []
         self._tracked_decode_keys = {
             "decode_append_kv",
             "decode_estimate_topk",
@@ -70,6 +74,11 @@ class QuestTiming:
             self._trace_allow = False
             return
         self._trace_allow = step_index < self.trace_decode_steps
+        if self._trace_allow:
+            now = time.perf_counter()
+            if self._trace_t0 is None:
+                self._trace_t0 = now
+            self._trace_step_ts.append(now)
 
     def _trace_should_record(self, key: str) -> bool:
         if not self._trace_allow:
@@ -212,7 +221,14 @@ class QuestTiming:
         if not events:
             return
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        if path.endswith(".svg"):
+        if path.endswith(".png"):
+            svg_path = path[:-4] + ".svg"
+            self._write_svg_timeline(svg_path, events)
+            if not self._convert_svg_to_png(svg_path, path):
+                print(f"[Quest] PNG export failed; keeping SVG at {svg_path}")
+            else:
+                print(f"[Quest] Timeline saved to {path}")
+        elif path.endswith(".svg"):
             self._write_svg_timeline(path, events)
         else:
             trace_path = path if path.endswith(".json") else f"{path}.json"
@@ -280,10 +296,57 @@ class QuestTiming:
                 f'fill="{color_for(name)}" opacity="0.8" />'
             )
 
+        if self._trace_step_ts and self._trace_t0 is not None:
+            y1 = top_margin - 6
+            y2 = height - 10
+            for step_t in self._trace_step_ts:
+                step_us = (step_t - self._trace_t0) * 1_000_000.0
+                if step_us <= 0:
+                    continue
+                x = left_margin + step_us * scale
+                lines.append(
+                    f'<line x1="{x:.2f}" y1="{y1}" x2="{x:.2f}" y2="{y2}" '
+                    f'stroke=\"#999999\" stroke-dasharray=\"4,4\" stroke-width=\"1\" />'
+                )
+
         lines.append("</svg>")
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         print(f"[Quest] Timeline saved to {path}")
+
+    def _convert_svg_to_png(self, svg_path: str, png_path: str) -> bool:
+        if shutil.which("rsvg-convert"):
+            try:
+                subprocess.run(
+                    ["rsvg-convert", "-o", png_path, svg_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return True
+            except Exception:
+                return False
+        if sys.platform == "darwin" and shutil.which("qlmanage"):
+            out_dir = os.path.dirname(png_path) or "."
+            try:
+                subprocess.run(
+                    ["qlmanage", "-t", "-s", "1000", "-o", out_dir, svg_path],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                return False
+            generated = os.path.join(out_dir, os.path.basename(svg_path) + ".png")
+            if not os.path.exists(generated):
+                return False
+            try:
+                if os.path.abspath(generated) != os.path.abspath(png_path):
+                    os.replace(generated, png_path)
+                return True
+            except Exception:
+                return False
+        return False
 
     def _timeline_title(self) -> str:
         if self.trace_phase == "decode":

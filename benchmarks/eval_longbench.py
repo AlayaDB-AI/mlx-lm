@@ -85,6 +85,11 @@ def main():
         default=3,
         help="Number of decode steps to include in Quest trace (<=0 disables decode tracing)"
     )
+    parser.add_argument(
+        "--quest-prefill-layer-log",
+        action="store_true",
+        help="Log per-layer prefill time for Quest"
+    )
     
     args = parser.parse_args()
     
@@ -118,6 +123,7 @@ def main():
             timing_sync=args.quest_timing_sync,
             trace_output=args.quest_trace_output or None,
             trace_decode_steps=args.quest_trace_decode_steps,
+            log_prefill_layer_timing=args.quest_prefill_layer_log,
         )
         
         from alayajet.features.chunking import ChunkComputationFeature
@@ -155,7 +161,7 @@ def main():
         start_time = time.time()
         
         # Generation
-        prefill_step_size = 70000
+        prefill_step_size = 40000
         print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
         
         ttft = None

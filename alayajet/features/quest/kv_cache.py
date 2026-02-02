@@ -4,7 +4,7 @@ import os
 import queue
 import threading
 from collections import OrderedDict
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple, Dict, Set
 
 try:
     import fcntl
@@ -242,6 +242,7 @@ class DiskOffloadKvCache:
         async_disk_write: bool = False,
         buffer_pool_pages: Optional[int] = None,
         disable_os_cache: bool = True,
+        release_active_buffer_on_prefill: bool = False,
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads # Stores num_kv_heads
@@ -252,6 +253,7 @@ class DiskOffloadKvCache:
         self.name = name
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
+        self.release_active_buffer_on_prefill = release_active_buffer_on_prefill
 
         # Capacity in number of pages/blocks
         self.capacity = (max_seq_len + page_size - 1) // page_size
@@ -291,6 +293,7 @@ class DiskOffloadKvCache:
         
         # Active buffers in MX: layer_idx -> mx.array
         self.active_buffers_mx: Dict[int, mx.array] = {}
+        self._last_page_written_layers: Set[int] = set()
         
         self.seq_len = 0
 
@@ -328,33 +331,63 @@ class DiskOffloadKvCache:
                 new_idx = self.alloc_block()
                 self.active_indices.append(new_idx)
                 appended_page_count += 1
-                
-                # Initialize active buffers for all layers (MX only).
-                for l in range(self.num_layers):
-                    # Shape: (2, page_size, num_heads, head_dim)
-                    self.active_buffers_mx[l] = mx.zeros(
-                        (2, self.page_size, self.num_heads, self.head_dim),
-                        dtype=self.mx_dtype
-                    )
+                self._last_page_written_layers.clear()
+                if self.release_active_buffer_on_prefill:
+                    self.active_buffers_mx.clear()
+                else:
+                    # Initialize active buffers for all layers (MX only).
+                    for l in range(self.num_layers):
+                        # Shape: (2, page_size, num_heads, head_dim)
+                        self.active_buffers_mx[l] = mx.zeros(
+                            (2, self.page_size, self.num_heads, self.head_dim),
+                            dtype=self.mx_dtype
+                        )
             self.seq_len += 1
         return appended_page_count
     
+    def _write_active_buffer_page(self, layer_idx: int, page_idx: int, buffer_mx: mx.array):
+        buffer_np = np.array(buffer_mx)
+        if buffer_np.dtype != self.dtype:
+            buffer_np = buffer_np.astype(self.dtype, copy=False)
+        for kv_head in range(self.num_heads):
+            page_id = (layer_idx, page_idx, kv_head)
+            head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
+            self.buffer_pool.write_page(page_id, head_slice)
+
     def flush_active_buffers(self, page_idx: int):
         """Writes active buffers to buffer pool."""
-        for l, buffer_mx in self.active_buffers_mx.items():
-            buffer_np = np.array(buffer_mx)
-            if buffer_np.dtype != self.dtype:
-                buffer_np = buffer_np.astype(self.dtype, copy=False)
-            for kv_head in range(self.num_heads):
-                page_id = (l, page_idx, kv_head)
-                head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
-                self.buffer_pool.write_page(page_id, head_slice)
+        for l, buffer_mx in list(self.active_buffers_mx.items()):
+            self._write_active_buffer_page(l, page_idx, buffer_mx)
 
     def get_active_buffer(self, layer_idx: int) -> Optional[np.ndarray]:
         return None
 
     def get_active_buffer_mx(self, layer_idx: int) -> Optional[mx.array]:
-        return self.active_buffers_mx.get(layer_idx)
+        buffer_mx = self.active_buffers_mx.get(layer_idx)
+        if buffer_mx is not None:
+            return buffer_mx
+        if not self.active_indices:
+            return None
+        page_idx = self.active_indices[-1]
+        if layer_idx in self._last_page_written_layers:
+            buffer_mx = self.load_page_mx(layer_idx, page_idx)
+        else:
+            buffer_mx = mx.zeros(
+                (2, self.page_size, self.num_heads, self.head_dim),
+                dtype=self.mx_dtype,
+            )
+        self.active_buffers_mx[layer_idx] = buffer_mx
+        return buffer_mx
+
+    def offload_active_buffer(self, layer_idx: int):
+        if not self.active_indices:
+            return
+        buffer_mx = self.active_buffers_mx.pop(layer_idx, None)
+        if buffer_mx is None:
+            return
+        page_idx = self.active_indices[-1]
+        self._write_active_buffer_page(layer_idx, page_idx, buffer_mx)
+        self._last_page_written_layers.add(layer_idx)
 
     def load_pages(self, layer_idx: int, page_indices: List[int]) -> mx.array:
         """
@@ -374,6 +407,16 @@ class DiskOffloadKvCache:
             pages.append(page)
         pages_np = np.stack(pages, axis=0)
         return mx.array(pages_np)
+
+    def load_page_mx(self, layer_idx: int, page_idx: int) -> mx.array:
+        heads = []
+        for kv_head in range(self.num_heads):
+            page_id = (layer_idx, page_idx, kv_head)
+            heads.append(self.buffer_pool.get_page_mx(page_id))
+        page_mx = mx.stack(heads, axis=2)
+        if page_mx.dtype != self.mx_dtype:
+            page_mx = page_mx.astype(self.mx_dtype)
+        return page_mx
 
     def load_kv_slices(
         self,
@@ -464,6 +507,7 @@ class DiskOffloadKvCache:
         self.free_slots = set(range(self.capacity))
         self.active_indices.clear()
         self.active_buffers_mx.clear()
+        self._last_page_written_layers.clear()
 
 
 class QuestController:
@@ -484,6 +528,7 @@ class QuestController:
         async_disk_write: bool = False,
         buffer_pool_pages: Optional[int] = None,
         disable_os_cache: bool = True,
+        release_active_buffer_on_prefill: bool = False,
     ):
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -494,7 +539,7 @@ class QuestController:
         self.dtype = dtype
         if buffer_pool_pages is None:
             group_size = max(1, self.num_heads // self.num_kv_heads)
-            buffer_pool_pages = page_budget * group_size
+            buffer_pool_pages = page_budget * group_size * 2
         buffer_pool_pages = max(1, buffer_pool_pages)
         
         # Main KV Cache (Disk Backed)
@@ -515,6 +560,7 @@ class QuestController:
             async_disk_write=async_disk_write,
             buffer_pool_pages=buffer_pool_pages,
             disable_os_cache=disable_os_cache,
+            release_active_buffer_on_prefill=release_active_buffer_on_prefill,
         )
         
         # Metadata Cache (RAM)
