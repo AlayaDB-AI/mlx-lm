@@ -185,6 +185,9 @@ class BufferPool:
         if page_id in self.lru:
             self.lru.move_to_end(page_id, last=True)
 
+    def has_page(self, page_id: Tuple[int, int, int]) -> bool:
+        return page_id in self.page_table
+
     def _get_frame(self, page_id: Tuple[int, int, int], assume_zero: bool) -> int:
         frame_idx = self.page_table.get(page_id)
         if frame_idx is not None:
@@ -214,6 +217,21 @@ class BufferPool:
             cached = mx.array(self.frames[frame_idx]).astype(self.mx_dtype)
             self.frame_mx_cache[frame_idx] = cached
         return cached
+
+    def read_page_raw(self, page_id: Tuple[int, int, int]) -> np.ndarray:
+        offset = self._page_offset(page_id)
+        data = os.pread(self.fd, self.page_bytes, offset)
+        if len(data) != self.page_bytes:
+            raise RuntimeError(
+                f"Short read for page {page_id}: {len(data)} != {self.page_bytes}"
+            )
+        return np.frombuffer(data, dtype=self.dtype).reshape(self.frame_shape)
+
+    def insert_page_cache(self, page_id: Tuple[int, int, int], frame: np.ndarray):
+        frame_idx = self._get_frame(page_id, assume_zero=True)
+        self.frames[frame_idx][...] = frame
+        self.frame_dirty[frame_idx] = False
+        self.frame_mx_cache[frame_idx] = None
 
     def write_page(self, page_id: Tuple[int, int, int], data: np.ndarray):
         frame_idx = self._get_frame(page_id, assume_zero=True)

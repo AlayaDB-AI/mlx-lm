@@ -1,5 +1,6 @@
 import mlx.core as mx
 import time
+import sys
 from ..base import AlayaFeature
 from .kv_cache import QuestController
 from .ops import append_kv, decode_estimate, decode_topk, decode_sparse_attn, apply_rope_in_place
@@ -25,6 +26,7 @@ class QuestFeature(AlayaFeature):
         log_decode_lru_hit_rate: bool = False,
         log_memory: bool = False,
         log_memory_sync: bool = True,
+        log_prefill_progress: bool = True,
     ):
         super().__init__()
         self.page_budget = page_budget
@@ -43,6 +45,7 @@ class QuestFeature(AlayaFeature):
         self.log_decode_lru_hit_rate = log_decode_lru_hit_rate
         self.log_memory = log_memory
         self.log_memory_sync = log_memory_sync
+        self.log_prefill_progress = log_prefill_progress
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
@@ -166,6 +169,31 @@ class QuestFeature(AlayaFeature):
             f"[Quest][Mem] {tag} | active={self._format_mem(active)} "
             f"peak={self._format_mem(peak)} cache={self._format_mem(cache)}"
         )
+
+    def _update_prefill_progress(self, layer_idx: int, seq_len: int):
+        if not self.log_prefill_progress:
+            return
+        if self.controller is None:
+            return
+        total_layers = self.controller.num_layers
+        if total_layers <= 0:
+            return
+        step = min(layer_idx + 1, total_layers)
+        pct = step / total_layers
+        bar_len = 24
+        filled = int(bar_len * pct)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        line = (
+            f"[Quest][Prefill] L={seq_len} {step}/{total_layers} "
+            f"[{bar}] {pct * 100:5.1f}%"
+        )
+        use_inplace = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+        if use_inplace:
+            end = "\n" if step == total_layers else ""
+            sys.stdout.write(f"\r\033[2K{line}{end}")
+            sys.stdout.flush()
+        else:
+            print(line, flush=True)
 
     def forward_hook(self, attn_layer, x: mx.array, mask=None, cache=None):
         """
@@ -306,7 +334,12 @@ class QuestFeature(AlayaFeature):
             q_sdpa = mx.expand_dims(q_in.transpose(1, 0, 2), axis=0) 
             
             t_sparse = time.perf_counter() if self.timing.enabled else None
-            out_sdpa = decode_sparse_attn(q_sdpa, topk, self.controller, layer_idx)
+            out_sdpa = decode_sparse_attn(
+                q_sdpa,
+                topk,
+                self.controller,
+                layer_idx,
+            )
             if self.timing.enabled:
                 self.timing.record("decode_sparse_attn", t_sparse, out_sdpa)
             # out_sdpa: (1, H, 1, D)
@@ -345,6 +378,8 @@ class QuestFeature(AlayaFeature):
         if layer_t0 is not None:
             elapsed = (time.perf_counter() - layer_t0) * 1000.0
             print(f"[Quest][Prefill] Layer {layer_idx:02d} | L={L} | {elapsed:.2f} ms")
+        if phase == "prefill":
+            self._update_prefill_progress(layer_idx, L)
         if (
             phase == "decode"
             and self.log_decode_lru_hit_rate

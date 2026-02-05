@@ -97,7 +97,8 @@ class AlayaEngine:
         log_prefill_io_overlap: bool = False,
         log_decode_lru_hit_rate: bool = False,
         log_memory: bool = False,
-        log_memory_sync: bool = True
+        log_memory_sync: bool = True,
+        log_prefill_progress: bool = True,
     ):
         engine = cls()
         engine.add_feature(
@@ -115,7 +116,8 @@ class AlayaEngine:
                 log_prefill_io_overlap=log_prefill_io_overlap,
                 log_decode_lru_hit_rate=log_decode_lru_hit_rate,
                 log_memory=log_memory,
-                log_memory_sync=log_memory_sync
+                log_memory_sync=log_memory_sync,
+                log_prefill_progress=log_prefill_progress,
             )
         )
         return engine

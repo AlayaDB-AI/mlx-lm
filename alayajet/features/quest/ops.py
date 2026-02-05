@@ -1,8 +1,6 @@
 import time
 import mlx.core as mx
 import numpy as np
-import mlx.nn as nn
-from typing import List, Optional, Tuple, Union
 from .kv_cache import QuestController
 
 def apply_rope_in_place(
@@ -189,7 +187,7 @@ def decode_sparse_attn(
     controller: QuestController,
     layer_idx: int,
     rope_scale: float = 1.0,
-    rope_theta: float = 1e4
+    rope_theta: float = 1e4,
 ) -> mx.array:
     """
     Compute attention using selected pages (from Disk) + last page (active buffer).
@@ -216,20 +214,7 @@ def decode_sparse_attn(
     num_kv_heads = controller.kv_cache.num_heads # H_kv
     group_size = num_heads // num_kv_heads
     
-    # 1. Vectorized Disk Load (LRU cached)
-    # physical_indices: (H_q, k)
-    # kv_head_indices: (H_q, 1)
-    if timing_hook:
-        t_disk = time.perf_counter()
     kv_head_indices = (np.arange(num_heads, dtype=np.int64) // group_size)[:, None]
-    k_disk_mx, v_disk_mx = controller.kv_cache.load_kv_slices_mx(
-        layer_idx,
-        physical_indices,
-        kv_head_indices,
-        dtype=q.dtype,
-    )
-    if timing_hook:
-        timing_hook("decode_disk_read", t_disk)
     
     # 2. Process Last Page (Active Buffer)
     if timing_hook:
@@ -254,58 +239,41 @@ def decode_sparse_attn(
     if timing_hook:
         timing_hook("decode_last_page", t_last, last_k_mx, last_v_mx)
     
-    # 3. Streaming Attention (log-sum-exp over blocks)
+    # 3. One-shot SDPA (streaming path removed).
     if timing_hook:
         t_stream = time.perf_counter()
     scale = 1.0 / mx.sqrt(q.shape[-1])
-    q_vec = q[0, :, 0, :] * scale
-
-    def stream_update(m_prev, l_prev, o_prev, k_block, v_block):
-        scores = mx.matmul(q_vec[:, None, :], k_block.transpose(0, 2, 1))[:, 0, :]
-        m_block = mx.max(scores, axis=-1, keepdims=True)
-        p = mx.exp(scores - m_block)
-        l_block = mx.sum(p, axis=-1, keepdims=True)
-        o_block = mx.matmul(p[:, None, :], v_block)[:, 0, :]
-        if m_prev is None:
-            return m_block, l_block, o_block
-        m_new = mx.maximum(m_prev, m_block)
-        l_new = l_prev * mx.exp(m_prev - m_new) + l_block * mx.exp(m_block - m_new)
-        o_new = o_prev * mx.exp(m_prev - m_new) + o_block * mx.exp(m_block - m_new)
-        return m_new, l_new, o_new
-
-    m = None
-    l = None
-    o = None
-
-    disk_len = k_disk_mx.shape[1]
-    if disk_len > 0:
-        page_size = controller.page_size
-        num_pages = disk_len // page_size
-        if num_pages > 0:
-            block_pages = min(8, num_pages)
-            for start_page in range(0, num_pages, block_pages):
-                end_page = min(num_pages, start_page + block_pages)
-                start_idx = start_page * page_size
-                end_idx = end_page * page_size
-                k_block = k_disk_mx[:, start_idx:end_idx, :]
-                v_block = v_disk_mx[:, start_idx:end_idx, :]
-                m, l, o = stream_update(m, l, o, k_block, v_block)
-        tail = disk_len - (num_pages * page_size)
-        if tail > 0:
-            k_tail = k_disk_mx[:, -tail:, :]
-            v_tail = v_disk_mx[:, -tail:, :]
-            m, l, o = stream_update(m, l, o, k_tail, v_tail)
-
-    if valid_len > 0:
-        m, l, o = stream_update(m, l, o, last_k_mx, last_v_mx)
-
-    if o is None:
+    if timing_hook:
+        t_disk = time.perf_counter()
+    disk_len = int(topk_indices.shape[1]) * controller.page_size
+    k_disk_mx, v_disk_mx = controller.kv_cache.load_kv_slices_mx(
+        layer_idx,
+        physical_indices,
+        kv_head_indices,
+        dtype=q.dtype,
+    )
+    if timing_hook:
+        timing_hook("decode_disk_read", t_disk)
+    if disk_len == 0 and valid_len == 0:
         out = mx.zeros_like(q)
     else:
-        out_heads = o / l
-        out = mx.expand_dims(mx.expand_dims(out_heads, axis=1), axis=0)
-
+        if disk_len == 0:
+            k_full = last_k_mx
+            v_full = last_v_mx
+        elif valid_len == 0:
+            k_full = k_disk_mx
+            v_full = v_disk_mx
+        else:
+            k_full = mx.concatenate([k_disk_mx, last_k_mx], axis=1)
+            v_full = mx.concatenate([v_disk_mx, last_v_mx], axis=1)
+        k_full = mx.expand_dims(k_full, axis=0)
+        v_full = mx.expand_dims(v_full, axis=0)
+        out = mx.fast.scaled_dot_product_attention(
+            q,
+            k_full,
+            v_full,
+            scale=scale,
+        )
     if timing_hook:
         timing_hook("decode_stream_attn", t_stream, out)
-
     return out

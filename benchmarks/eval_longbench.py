@@ -112,7 +112,6 @@ def main():
         action="store_true",
         help="Log Quest memory checkpoints during prefill"
     )
-    
     args = parser.parse_args()
     
     if not os.path.exists(args.data_path):
@@ -150,6 +149,7 @@ def main():
             log_decode_lru_hit_rate=args.quest_lru_log,
             log_memory=args.quest_mem_log,
             log_memory_sync=args.quest_timing_sync,
+            log_prefill_progress=True,
         )
         
         # from alayajet.features.chunking import ChunkComputationFeature
@@ -200,7 +200,7 @@ def main():
         start_time = time.time()
         
         # Generation
-        prefill_step_size = 16384
+        prefill_step_size = 8192
         print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
         
         ttft = None
@@ -208,12 +208,14 @@ def main():
         decode_time = None
         prediction = ""
         last_response = None
+        progress_callback = None
         for response in stream_generate(
             model,
             tokenizer,
             prompt=prompt_tokens,
             max_tokens=args.max_tokens,
             prefill_step_size=prefill_step_size,
+            prompt_progress_callback=progress_callback,
         ):
             if ttft is None and response.prompt_tps:
                 ttft = response.prompt_tokens / response.prompt_tps
