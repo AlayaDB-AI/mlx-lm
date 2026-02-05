@@ -4,6 +4,7 @@ import time
 import os
 import mlx.core as mx
 from mlx_lm import load, generate, stream_generate
+from mlx_lm.tokenizer_utils import TokenizerWrapper
 from alayajet.engine import AlayaEngine
 
 # LongBench NarrativeQA Prompt Template
@@ -45,6 +46,12 @@ def main():
     parser.add_argument("--cache-dir", type=str, default="./kv_cache_eval", help="Quest cache directory")
     parser.add_argument("--max-tokens", type=int, default=32, help="Max tokens for generation")
     parser.add_argument("--prompt-repeat", type=int, default=1, help="Repeat each prompt N times to extend context")
+    parser.add_argument(
+        "--max-prompt-tokens",
+        type=int,
+        default=None,
+        help="Truncate the prompt to the last N tokens before generation"
+    )
     parser.add_argument("--timing", action="store_true", help="Enable baseline timing breakdown")
     parser.add_argument(
         "--timing-sync",
@@ -90,6 +97,21 @@ def main():
         action="store_true",
         help="Log per-layer prefill time for Quest"
     )
+    parser.add_argument(
+        "--quest-prefill-io-log",
+        action="store_true",
+        help="Log per-chunk prefill read/attn overlap for Quest"
+    )
+    parser.add_argument(
+        "--quest-lru-log",
+        action="store_true",
+        help="Log per-step LRU hit rate during Quest decode"
+    )
+    parser.add_argument(
+        "--quest-mem-log",
+        action="store_true",
+        help="Log Quest memory checkpoints during prefill"
+    )
     
     args = parser.parse_args()
     
@@ -124,10 +146,14 @@ def main():
             trace_output=args.quest_trace_output or None,
             trace_decode_steps=args.quest_trace_decode_steps,
             log_prefill_layer_timing=args.quest_prefill_layer_log,
+            log_prefill_io_overlap=args.quest_prefill_io_log,
+            log_decode_lru_hit_rate=args.quest_lru_log,
+            log_memory=args.quest_mem_log,
+            log_memory_sync=args.quest_timing_sync,
         )
         
-        from alayajet.features.chunking import ChunkComputationFeature
-        engine.add_feature(ChunkComputationFeature(chunk_size=2048))
+        # from alayajet.features.chunking import ChunkComputationFeature
+        # engine.add_feature(ChunkComputationFeature(chunk_size=2048))
         
         engine.attach(model)
     elif args.timing:
@@ -155,13 +181,26 @@ def main():
         else:
             prompt_formatted = prompt
             
-        token_count = len(tokenizer.encode(prompt_formatted))
+        wrapped_tokenizer = tokenizer
+        if not isinstance(wrapped_tokenizer, TokenizerWrapper):
+            wrapped_tokenizer = TokenizerWrapper(tokenizer)
+        add_special_tokens = (
+            wrapped_tokenizer.bos_token is None
+            or not prompt_formatted.startswith(wrapped_tokenizer.bos_token)
+        )
+        prompt_tokens = wrapped_tokenizer.encode(
+            prompt_formatted, add_special_tokens=add_special_tokens
+        )
+        if args.max_prompt_tokens is not None and len(prompt_tokens) > args.max_prompt_tokens:
+            prompt_tokens = prompt_tokens[-args.max_prompt_tokens :]
+            print(f"[DEBUG] Prompt truncated to last {args.max_prompt_tokens} tokens.")
+        token_count = len(prompt_tokens)
         print(f"Context Length: {sample.get('length')} | Prompt Tokens: {token_count}")
         
         start_time = time.time()
         
         # Generation
-        prefill_step_size = 40000
+        prefill_step_size = 16384
         print(f"[DEBUG] Quest: {args.quest}, Prefill Step Size: {prefill_step_size}")
         
         ttft = None
@@ -172,7 +211,7 @@ def main():
         for response in stream_generate(
             model,
             tokenizer,
-            prompt=prompt_formatted,
+            prompt=prompt_tokens,
             max_tokens=args.max_tokens,
             prefill_step_size=prefill_step_size,
         ):

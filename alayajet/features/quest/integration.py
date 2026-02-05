@@ -3,6 +3,7 @@ import time
 from ..base import AlayaFeature
 from .kv_cache import QuestController
 from .ops import append_kv, decode_estimate, decode_topk, decode_sparse_attn, apply_rope_in_place
+from .prefill_pipeline import prefill_with_kv_cache_pipelined
 from .timing import QuestTiming
 from ...patch_utils import replace_method, patch_class_property
 import mlx_lm.models.cache as cache_module
@@ -20,6 +21,10 @@ class QuestFeature(AlayaFeature):
         trace_decode_steps: int | None = 3,
         release_active_buffer_on_prefill: bool = True,
         log_prefill_layer_timing: bool = False,
+        log_prefill_io_overlap: bool = False,
+        log_decode_lru_hit_rate: bool = False,
+        log_memory: bool = False,
+        log_memory_sync: bool = True,
     ):
         super().__init__()
         self.page_budget = page_budget
@@ -34,6 +39,10 @@ class QuestFeature(AlayaFeature):
         )
         self.release_active_buffer_on_prefill = release_active_buffer_on_prefill
         self.log_prefill_layer_timing = log_prefill_layer_timing
+        self.log_prefill_io_overlap = log_prefill_io_overlap
+        self.log_decode_lru_hit_rate = log_decode_lru_hit_rate
+        self.log_memory = log_memory
+        self.log_memory_sync = log_memory_sync
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
@@ -44,6 +53,8 @@ class QuestFeature(AlayaFeature):
         if self.timing.enabled:
             self.timing.report(prefix="[Quest][Timing][Summary]")
         self.timing.write_trace()
+        if self.controller is not None:
+            self.controller.close_prefill_resources()
 
     def on_attach(self, engine):
         self.engine = engine
@@ -125,10 +136,36 @@ class QuestFeature(AlayaFeature):
                 async_disk_write=self.async_disk_write,
                 release_active_buffer_on_prefill=self.release_active_buffer_on_prefill,
             )
+            self.controller.prefill_io_timing = self.log_prefill_io_overlap
             # Optional timing hook for fine-grained profiling.
             self.controller._timing_hook = self.timing.record if self.timing.enabled else None
             print(f"[Quest] Controller Initialized: {self.page_budget} pages budget, disk cache at {self.cache_dir}")
 
+    def _format_mem(self, value: int | None) -> str:
+        if value is None:
+            return "n/a"
+        return f"{value / (1024 * 1024):.1f}MiB"
+
+    def _log_mem(self, tag: str, *sync_arrays):
+        if not self.log_memory:
+            return
+        if self.log_memory_sync and sync_arrays:
+            to_sync = [arr for arr in sync_arrays if arr is not None]
+            if to_sync:
+                mx.eval(to_sync)
+        get_active = getattr(mx, "get_active_memory", None)
+        get_peak = getattr(mx, "get_peak_memory", None)
+        if get_active is None or get_peak is None:
+            print(f"[Quest][Mem] {tag} | stats unavailable")
+            return
+        active = get_active()
+        peak = get_peak()
+        get_cache = getattr(mx, "get_cache_memory", None)
+        cache = get_cache() if get_cache is not None else None
+        print(
+            f"[Quest][Mem] {tag} | active={self._format_mem(active)} "
+            f"peak={self._format_mem(peak)} cache={self._format_mem(cache)}"
+        )
 
     def forward_hook(self, attn_layer, x: mx.array, mask=None, cache=None):
         """
@@ -138,7 +175,10 @@ class QuestFeature(AlayaFeature):
         phase = "prefill" if L > 1 else "decode"
         layer_t0 = time.perf_counter() if self.log_prefill_layer_timing and phase == "prefill" else None
         layer_idx = self.engine.layer_counter
+        self.controller.set_prefill_write_through(phase == "prefill")
         if layer_idx == 0:
+            if phase == "prefill":
+                self.controller.kv_cache.buffer_pool.flush()
             if phase == "prefill":
                 self._decode_step = 0
             self.timing.begin_step(phase, self._decode_step if phase == "decode" else None)
@@ -146,6 +186,8 @@ class QuestFeature(AlayaFeature):
                 self._decode_step += 1
 
         # 1. Projections
+        if phase == "prefill":
+            self._log_mem(f"{phase}_L{layer_idx:02d}_start", x)
         t_proj = time.perf_counter() if self.timing.enabled else None
         q = attn_layer.q_proj(x)
         k = attn_layer.k_proj(x)
@@ -167,6 +209,8 @@ class QuestFeature(AlayaFeature):
             k = attn_layer.k_norm(k)
         if self.timing.enabled:
             self.timing.record(f"{phase}_proj", t_proj, q, k, v)
+        if phase == "prefill":
+            self._log_mem(f"{phase}_L{layer_idx:02d}_qkv", q, k, v)
         
         # 2. Quest Logic
         if layer_idx == 0:
@@ -194,6 +238,8 @@ class QuestFeature(AlayaFeature):
                  k = k.transpose(0, 2, 1, 3)
             if self.timing.enabled:
                 self.timing.record(f"{phase}_rope", t_rope, q, k)
+            if phase == "prefill":
+                self._log_mem(f"{phase}_L{layer_idx:02d}_rope", q, k)
             
         # 4. Append KV
         if B != 1:
@@ -211,35 +257,31 @@ class QuestFeature(AlayaFeature):
         
         # 5. Attention
         if L > 1:
-            # Simplified Prefill: Just compute attention on current chunk (q, k, v)
-            # Using MLX scaled_dot_product_attention on current inputs
-            # Transpose to (B, H, L, D)
+            # Prefill with streamed prefix KV to support unlimited context.
             q_p = q.transpose(0, 2, 1, 3)
             k_p = k.transpose(0, 2, 1, 3)
             v_p = v.transpose(0, 2, 1, 3)
-            
-            # Handle GQA for Prefill: Explicitly repeat KV heads
-            # MLX SDPA might not support implicit GQA broadcasting for H_kv > 1
-            if num_kv_heads != num_heads:
-                n_rep = num_heads // num_kv_heads
-                k_p = mx.repeat(k_p, n_rep, axis=1)
-                v_p = mx.repeat(v_p, n_rep, axis=1)
-            
-            # Causal mask: use built-in causal mode to avoid materializing an LxL mask.
-            mask = "causal"
-            
+
             t_prefill = time.perf_counter() if self.timing.enabled else None
-            out = mx.fast.scaled_dot_product_attention(
-                q_p, k_p, v_p, scale=1.0 / mx.sqrt(head_dim), mask=mask
+            out = prefill_with_kv_cache_pipelined(
+                q_p,
+                k_p,
+                v_p,
+                controller=self.controller,
+                layer_idx=layer_idx,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
             )
             if self.timing.enabled:
                 self.timing.record("prefill_attn", t_prefill, out)
-            
+
             # Output is (B, H, L, D) -> (B, L, H, D)
             out = out.transpose(0, 2, 1, 3)
-            
+
             # Best-effort release of large temporaries.
-            del q_p, k_p, v_p, mask
+            del q_p, k_p, v_p
+            self.controller.kv_cache.offload_active_buffer_async(layer_idx)
             
         else:
             # Decode: Quest Sparse Attention
@@ -287,6 +329,8 @@ class QuestFeature(AlayaFeature):
         out = attn_layer.o_proj(out)
         if self.timing.enabled:
             self.timing.record(f"{phase}_o_proj", t_out, out)
+        if phase == "prefill":
+            self._log_mem(f"{phase}_L{layer_idx:02d}_o_proj", out)
 
         if (
             self._prefill_start is not None
@@ -301,6 +345,19 @@ class QuestFeature(AlayaFeature):
         if layer_t0 is not None:
             elapsed = (time.perf_counter() - layer_t0) * 1000.0
             print(f"[Quest][Prefill] Layer {layer_idx:02d} | L={L} | {elapsed:.2f} ms")
+        if (
+            phase == "decode"
+            and self.log_decode_lru_hit_rate
+            and layer_idx == self.controller.num_layers - 1
+        ):
+            hits, misses = self.controller.kv_cache.pop_lru_stats()
+            total = hits + misses
+            hit_rate = (hits / total * 100.0) if total else 0.0
+            step_idx = max(self._decode_step - 1, 0)
+            print(
+                f"[Quest][LRU] Step {step_idx} | hit {hit_rate:.2f}% "
+                f"(hits={hits}, misses={misses})"
+            )
         
         # Manually increment layer counter since we bypassed the engine hook
         self.engine.layer_counter += 1

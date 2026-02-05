@@ -1,0 +1,3 @@
+[submodule "3rdparty/mlx"]
+	path = 3rdparty/mlx
+	url = git@github.com:AlayaDB-AI/mlx.git

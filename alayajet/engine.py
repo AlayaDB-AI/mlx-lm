@@ -94,6 +94,10 @@ class AlayaEngine:
         trace_decode_steps: int | None = 3,
         release_active_buffer_on_prefill: bool = True,
         log_prefill_layer_timing: bool = False,
+        log_prefill_io_overlap: bool = False,
+        log_decode_lru_hit_rate: bool = False,
+        log_memory: bool = False,
+        log_memory_sync: bool = True
     ):
         engine = cls()
         engine.add_feature(
@@ -108,6 +112,10 @@ class AlayaEngine:
                 trace_decode_steps=trace_decode_steps,
                 release_active_buffer_on_prefill=release_active_buffer_on_prefill,
                 log_prefill_layer_timing=log_prefill_layer_timing,
+                log_prefill_io_overlap=log_prefill_io_overlap,
+                log_decode_lru_hit_rate=log_decode_lru_hit_rate,
+                log_memory=log_memory,
+                log_memory_sync=log_memory_sync
             )
         )
         return engine

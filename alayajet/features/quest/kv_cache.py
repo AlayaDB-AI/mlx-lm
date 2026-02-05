@@ -3,6 +3,7 @@ import numpy as np
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from typing import List, Optional, Tuple, Dict, Set
 
@@ -109,11 +110,39 @@ class BufferPool:
             )
         self.write_bytes += self.page_bytes
 
+    def _invalidate_page(self, page_id: Tuple[int, int, int]):
+        frame_idx = self.page_table.get(page_id)
+        if frame_idx is None:
+            return
+        if page_id in self.lru:
+            del self.lru[page_id]
+        del self.page_table[page_id]
+        self.frame_dirty[frame_idx] = False
+        self.frame_page_id[frame_idx] = None
+        self.frame_mx_cache[frame_idx] = None
+        self.free_list.append(frame_idx)
+
+    def write_page_direct(self, page_id: Tuple[int, int, int], frame: np.ndarray):
+        frame_np = np.ascontiguousarray(frame, dtype=self.dtype)
+        self._enqueue_write(page_id, frame_np)
+        self._invalidate_page(page_id)
+
     def _enqueue_write(self, page_id: Tuple[int, int, int], frame: np.ndarray):
         if self._write_queue is None:
             self._write_page(page_id, frame)
             return
-        self._write_queue.put((page_id, np.array(frame, copy=True)))
+        self._write_queue.put(("page", page_id, np.array(frame, copy=True)))
+
+    def _enqueue_raw_write(self, offset: int, data: np.ndarray):
+        if self._write_queue is None:
+            written = os.pwrite(self.fd, data, offset)
+            if written != data.nbytes:
+                raise RuntimeError(
+                    f"Short write at offset {offset}: {written} != {data.nbytes}"
+                )
+            self.write_bytes += data.nbytes
+            return
+        self._write_queue.put(("raw", offset, data, data.nbytes))
 
     def _write_worker(self):
         if self._write_queue is None:
@@ -123,8 +152,18 @@ class BufferPool:
             if item is None:
                 self._write_queue.task_done()
                 break
-            page_id, frame = item
-            self._write_page(page_id, frame)
+            kind = item[0]
+            if kind == "page":
+                _, page_id, frame = item
+                self._write_page(page_id, frame)
+            elif kind == "raw":
+                _, offset, data, size = item
+                written = os.pwrite(self.fd, data, offset)
+                if written != size:
+                    raise RuntimeError(
+                        f"Short write at offset {offset}: {written} != {size}"
+                    )
+                self.write_bytes += size
             self._write_queue.task_done()
 
     def _evict_frame(self) -> int:
@@ -182,6 +221,13 @@ class BufferPool:
         self.frame_dirty[frame_idx] = True
         self.frame_mx_cache[frame_idx] = None
 
+    def write_page_async(self, page_id: Tuple[int, int, int], data: np.ndarray):
+        frame_idx = self._get_frame(page_id, assume_zero=True)
+        self.frames[frame_idx][...] = data
+        self.frame_mx_cache[frame_idx] = None
+        self._enqueue_write(page_id, self.frames[frame_idx])
+        self.frame_dirty[frame_idx] = False
+
     def write_kv_slice(
         self,
         page_id: Tuple[int, int, int],
@@ -197,6 +243,23 @@ class BufferPool:
         frame[1, page_offset:end] = v_slice
         self.frame_dirty[frame_idx] = True
         self.frame_mx_cache[frame_idx] = None
+
+    def write_kv_slice_direct(
+        self,
+        page_id: Tuple[int, int, int],
+        page_offset: int,
+        k_slice: np.ndarray,
+        v_slice: np.ndarray,
+    ):
+        k_np = np.ascontiguousarray(k_slice, dtype=self.dtype)
+        v_np = np.ascontiguousarray(v_slice, dtype=self.dtype)
+        stride = self.head_dim * self.dtype.itemsize
+        base = self._page_offset(page_id)
+        k_offset = base + (0 * self.page_size + page_offset) * stride
+        v_offset = base + (1 * self.page_size + page_offset) * stride
+        self._enqueue_raw_write(k_offset, np.array(k_np, copy=True))
+        self._enqueue_raw_write(v_offset, np.array(v_np, copy=True))
+        self._invalidate_page(page_id)
 
     def flush(self):
         for page_id, frame_idx in list(self.page_table.items()):
@@ -221,6 +284,13 @@ class BufferPool:
             self._write_queue.put(None)
             self._write_queue.join()
         os.close(self.fd)
+
+    def pop_lru_stats(self) -> Tuple[int, int]:
+        hits = self.hits
+        misses = self.misses
+        self.hits = 0
+        self.misses = 0
+        return hits, misses
 
 
 class DiskOffloadKvCache:
@@ -254,6 +324,7 @@ class DiskOffloadKvCache:
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
         self.release_active_buffer_on_prefill = release_active_buffer_on_prefill
+        self.write_through = False
 
         # Capacity in number of pages/blocks
         self.capacity = (max_seq_len + page_size - 1) // page_size
@@ -352,7 +423,22 @@ class DiskOffloadKvCache:
         for kv_head in range(self.num_heads):
             page_id = (layer_idx, page_idx, kv_head)
             head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
-            self.buffer_pool.write_page(page_id, head_slice)
+            if self.write_through:
+                self.buffer_pool.write_page_direct(page_id, head_slice)
+            else:
+                self.buffer_pool.write_page(page_id, head_slice)
+
+    def _write_active_buffer_page_async(self, layer_idx: int, page_idx: int, buffer_mx: mx.array):
+        buffer_np = np.array(buffer_mx)
+        if buffer_np.dtype != self.dtype:
+            buffer_np = buffer_np.astype(self.dtype, copy=False)
+        for kv_head in range(self.num_heads):
+            page_id = (layer_idx, page_idx, kv_head)
+            head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
+            if self.write_through:
+                self.buffer_pool.write_page_direct(page_id, head_slice)
+            else:
+                self.buffer_pool.write_page_async(page_id, head_slice)
 
     def flush_active_buffers(self, page_idx: int):
         """Writes active buffers to buffer pool."""
@@ -387,6 +473,16 @@ class DiskOffloadKvCache:
             return
         page_idx = self.active_indices[-1]
         self._write_active_buffer_page(layer_idx, page_idx, buffer_mx)
+        self._last_page_written_layers.add(layer_idx)
+
+    def offload_active_buffer_async(self, layer_idx: int):
+        if not self.active_indices:
+            return
+        buffer_mx = self.active_buffers_mx.pop(layer_idx, None)
+        if buffer_mx is None:
+            return
+        page_idx = self.active_indices[-1]
+        self._write_active_buffer_page_async(layer_idx, page_idx, buffer_mx)
         self._last_page_written_layers.add(layer_idx)
 
     def load_pages(self, layer_idx: int, page_indices: List[int]) -> mx.array:
@@ -487,18 +583,27 @@ class DiskOffloadKvCache:
         k_np: np.ndarray,
         v_np: np.ndarray,
         assume_zero: bool,
+        write_through: bool = False,
     ):
         for kv_head in range(self.num_heads):
             page_id = (layer_idx, page_idx, kv_head)
             k_slice = k_np[:, kv_head, :]
             v_slice = v_np[:, kv_head, :]
-            self.buffer_pool.write_kv_slice(
-                page_id=page_id,
-                page_offset=page_offset,
-                k_slice=k_slice,
-                v_slice=v_slice,
-                assume_zero=assume_zero,
-            )
+            if write_through:
+                self.buffer_pool.write_kv_slice_direct(
+                    page_id=page_id,
+                    page_offset=page_offset,
+                    k_slice=k_slice,
+                    v_slice=v_slice,
+                )
+            else:
+                self.buffer_pool.write_kv_slice(
+                    page_id=page_id,
+                    page_offset=page_offset,
+                    k_slice=k_slice,
+                    v_slice=v_slice,
+                    assume_zero=assume_zero,
+                )
 
     def release(self):
         self.buffer_pool.reset()
@@ -508,6 +613,9 @@ class DiskOffloadKvCache:
         self.active_indices.clear()
         self.active_buffers_mx.clear()
         self._last_page_written_layers.clear()
+
+    def pop_lru_stats(self) -> Tuple[int, int]:
+        return self.buffer_pool.pop_lru_stats()
 
 
 class QuestController:
@@ -580,9 +688,18 @@ class QuestController:
         # Current state
         self.kv_indices_with_last = []
         self.kv_indices_without_last = []
+        self.prefill_io_timing = False
+        self.prefill_write_through = False
+        self._prefill_executor: Optional[ThreadPoolExecutor] = None
+        self._prefill_buffers: Optional[List[np.ndarray]] = None
+        self._prefill_buffer_spec: Optional[Tuple[int, int, int, int, np.dtype]] = None
         
     def set_page_budget(self, page_budget: int):
         self._page_budget = page_budget
+
+    def set_prefill_write_through(self, enabled: bool):
+        self.prefill_write_through = enabled
+        self.kv_cache.write_through = enabled
         
     def prepare_metadata(self, seq_len: int):
         """
@@ -630,3 +747,39 @@ class QuestController:
     
     def clean_states(self):
         self.kv_cache.release()
+        self.close_prefill_resources()
+
+    def get_prefill_executor(self) -> ThreadPoolExecutor:
+        if self._prefill_executor is None:
+            self._prefill_executor = ThreadPoolExecutor(max_workers=1)
+        return self._prefill_executor
+
+    def get_prefill_buffers(
+        self,
+        chunk_pages: int,
+        page_size: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: np.dtype,
+    ) -> List[np.ndarray]:
+        spec = (chunk_pages, page_size, num_kv_heads, head_dim, np.dtype(dtype))
+        if self._prefill_buffers is None or self._prefill_buffer_spec != spec:
+            self._prefill_buffers = [
+                np.empty(
+                    (chunk_pages, 2, page_size, num_kv_heads, head_dim),
+                    dtype=spec[4],
+                ),
+                np.empty(
+                    (chunk_pages, 2, page_size, num_kv_heads, head_dim),
+                    dtype=spec[4],
+                ),
+            ]
+            self._prefill_buffer_spec = spec
+        return self._prefill_buffers
+
+    def close_prefill_resources(self):
+        if self._prefill_executor is not None:
+            self._prefill_executor.shutdown(wait=True)
+            self._prefill_executor = None
+        self._prefill_buffers = None
+        self._prefill_buffer_spec = None

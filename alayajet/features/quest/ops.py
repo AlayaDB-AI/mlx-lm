@@ -88,6 +88,7 @@ def append_kv(
                 k_np=k_np,
                 v_np=v_np,
                 assume_zero=(page_offset == 0),
+                write_through=controller.prefill_write_through,
             )
             
             # Metadata update for disk page
