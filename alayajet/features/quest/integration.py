@@ -1,9 +1,10 @@
 import mlx.core as mx
 import time
 import sys
+import numpy as np
 from ..base import AlayaFeature
 from .kv_cache import QuestController
-from .ops import append_kv, decode_estimate, decode_topk, decode_sparse_attn, apply_rope_in_place
+from .ops import append_kv, decode_estimate, decode_topk_np, decode_sparse_attn, apply_rope_in_place
 from .prefill_pipeline import prefill_with_kv_cache_pipelined
 from .timing import QuestTiming
 from ...patch_utils import replace_method, patch_class_property
@@ -320,13 +321,16 @@ class QuestFeature(AlayaFeature):
             if need_estimate:
                 t_est = time.perf_counter() if self.timing.enabled else None
                 scores = decode_estimate(q_in, self.controller, layer_idx)
-                topk = decode_topk(scores, self.controller.inference_page_budget)
+                topk = decode_topk_np(
+                    np.array(scores),
+                    self.controller.inference_page_budget,
+                )
                 if self.timing.enabled:
-                    self.timing.record("decode_estimate_topk", t_est, topk)
+                    self.timing.record("decode_estimate_topk", t_est)
             else:
                 num_pages = len(self.controller.kv_indices_without_last)
-                base_indices = mx.arange(num_pages)[None, :]
-                topk = mx.repeat(base_indices, q_in.shape[1], axis=0)
+                base_indices = np.arange(num_pages, dtype=np.int64)[None, :]
+                topk = np.repeat(base_indices, q_in.shape[1], axis=0)
 
             # 2. Sparse Attn
             # q_in: (1, H, D) -> need (1, H, 1, D) for SDPA

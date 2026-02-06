@@ -45,9 +45,16 @@ def append_kv(
         k_chunk = k[current_offset_in_input : current_offset_in_input + tokens_to_write]
         v_chunk = v[current_offset_in_input : current_offset_in_input + tokens_to_write]
         
-        k_chunk_f32 = k_chunk.astype(mx.float32)
-        chunk_k_min = np.array(mx.min(k_chunk_f32, axis=0))
-        chunk_k_max = np.array(mx.max(k_chunk_f32, axis=0))
+        if tokens_to_write == 1:
+            # Min/max over a single token is the token itself; avoid reductions.
+            k_chunk_f32 = k_chunk.astype(mx.float32)
+            chunk_k = k_chunk_f32[0]
+            chunk_k_min = chunk_k
+            chunk_k_max = chunk_k
+        else:
+            k_chunk_f32 = k_chunk.astype(mx.float32)
+            chunk_k_min = mx.min(k_chunk_f32, axis=0)
+            chunk_k_max = mx.max(k_chunk_f32, axis=0)
         
         is_last_page = (page_idx == len(controller.kv_cache.active_indices) - 1)
         
@@ -66,8 +73,14 @@ def append_kv(
             else:
                 prev_min = controller.metadata_pool[layer_idx, phys_page_idx, 0]
                 prev_max = controller.metadata_pool[layer_idx, phys_page_idx, 1]
-                new_min = np.minimum(prev_min, chunk_k_min)
-                new_max = np.maximum(prev_max, chunk_k_max)
+                chunk_k_min_np = np.asarray(chunk_k_min)
+                chunk_k_max_np = np.asarray(chunk_k_max)
+                if chunk_k_min_np.dtype != np.float32:
+                    chunk_k_min_np = chunk_k_min_np.astype(np.float32, copy=False)
+                if chunk_k_max_np.dtype != np.float32:
+                    chunk_k_max_np = chunk_k_max_np.astype(np.float32, copy=False)
+                new_min = np.minimum(prev_min, chunk_k_min_np)
+                new_max = np.maximum(prev_max, chunk_k_max_np)
                 controller.update_metadata(layer_idx, phys_page_idx, new_min, new_max)
             
         else:
@@ -103,8 +116,14 @@ def append_kv(
                 prev_min = controller.metadata_pool[layer_idx][physical_block_idx, 0]
                 prev_max = controller.metadata_pool[layer_idx][physical_block_idx, 1]
                 
-                new_min = np.minimum(prev_min, chunk_k_min)
-                new_max = np.maximum(prev_max, chunk_k_max)
+                chunk_k_min_np = np.asarray(chunk_k_min)
+                chunk_k_max_np = np.asarray(chunk_k_max)
+                if chunk_k_min_np.dtype != np.float32:
+                    chunk_k_min_np = chunk_k_min_np.astype(np.float32, copy=False)
+                if chunk_k_max_np.dtype != np.float32:
+                    chunk_k_max_np = chunk_k_max_np.astype(np.float32, copy=False)
+                new_min = np.minimum(prev_min, chunk_k_min_np)
+                new_max = np.maximum(prev_max, chunk_k_max_np)
                 
                 controller.update_metadata(layer_idx, physical_block_idx, new_min, new_max)
         
@@ -126,36 +145,30 @@ def decode_estimate(
     if not pages_indices:
         return mx.zeros((q.shape[1], 0), dtype=q.dtype)
         
-    # Get metadata tensor: (2, NumPages, H_kv, D)
-    metadata = controller.get_metadata_tensor(layer_idx, pages_indices)
-    
-    K_min = metadata[0] # (NumPages, H_kv, D) -> need (H_kv, NumPages, D)
-    K_max = metadata[1]
-    
-    K_min = K_min.transpose(1, 0, 2)
-    K_max = K_max.transpose(1, 0, 2)
-    
-    # Check for GQA mismatch
     H_q = q.shape[1]
+    # Get metadata shaped for estimate: (H_kv, NumPages, D)
+    K_min, K_max = controller.get_metadata_kminmax(layer_idx)
+    
     H_kv = K_min.shape[0]
-    
-    if H_q != H_kv:
-        n_rep = H_q // H_kv
-        # Expand KV metadata to match Query heads
-        # (H_kv, NumPages, D) -> (H_q, NumPages, D)
-        K_min = mx.repeat(K_min, n_rep, axis=0)
-        K_max = mx.repeat(K_max, n_rep, axis=0)
-    
     # Q: (1, H_q, D) -> (H_q, 1, D)
     Q = q.transpose(1, 0, 2)
-    
+
+    if H_q == H_kv:
+        Q_pos = mx.maximum(Q, 0.0)
+        Q_neg = mx.minimum(Q, 0.0)
+        term1 = Q_pos * K_max
+        term2 = Q_neg * K_min
+        score = mx.sum(term1 + term2, axis=-1)  # (H_q, NumPages)
+        return score
+
+    group_size = H_q // H_kv
+    Q = Q.reshape(H_kv, group_size, 1, Q.shape[-1])
     Q_pos = mx.maximum(Q, 0.0)
     Q_neg = mx.minimum(Q, 0.0)
-    
-    term1 = Q_pos * K_max 
-    term2 = Q_neg * K_min 
-    
-    score = mx.sum(term1 + term2, axis=-1) # (H_q, NumPages)
+    K_min = mx.expand_dims(K_min, axis=1)
+    K_max = mx.expand_dims(K_max, axis=1)
+    score = mx.sum(Q_pos * K_max + Q_neg * K_min, axis=-1)  # (H_kv, group_size, NumPages)
+    score = score.reshape(H_q, -1)
     
     return score
 
@@ -181,6 +194,24 @@ def decode_topk(
     return top_indices
 
 
+def decode_topk_np(
+    estimated_scores: np.ndarray,
+    page_budget: int,
+) -> np.ndarray:
+    """
+    Select top-k pages (numpy path).
+    """
+    if estimated_scores.shape[1] <= page_budget:
+        base_indices = np.arange(estimated_scores.shape[1], dtype=np.int64)[None, :]
+        return np.repeat(base_indices, estimated_scores.shape[0], axis=0)
+
+    k = page_budget
+    indices = np.argpartition(estimated_scores, -k, axis=-1)
+    top_indices = indices[:, -k:]
+    top_indices = np.sort(top_indices, axis=-1)
+    return top_indices.astype(np.int64, copy=False)
+
+
 def decode_sparse_attn(
     q: mx.array,
     topk_indices: mx.array,
@@ -203,7 +234,7 @@ def decode_sparse_attn(
     if timing_hook:
         t_indices = time.perf_counter()
     candidate_indices = np.array(controller.kv_indices_without_last, dtype=np.int64)
-    topk_indices_np = np.array(topk_indices).astype(np.int64) # (H_q, k)
+    topk_indices_np = np.asarray(topk_indices, dtype=np.int64) # (H_q, k)
     logical_indices = candidate_indices[topk_indices_np]
     active_indices = np.array(controller.kv_cache.active_indices, dtype=np.int64)
     physical_indices = active_indices[logical_indices].astype(np.int64)

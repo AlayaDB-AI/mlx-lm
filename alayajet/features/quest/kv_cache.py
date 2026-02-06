@@ -572,13 +572,25 @@ class DiskOffloadKvCache:
         if physical_indices.size == 0:
             empty = mx.zeros((num_heads, 0, self.head_dim), dtype=dtype)
             return empty, empty
-        pages = []
-        for h in range(num_heads):
-            kv_head = int(kv_head_indices[h, 0])
-            for j in range(k):
-                page_idx = int(physical_indices[h, j])
-                page_id = (layer_idx, page_idx, kv_head)
-                pages.append(self.buffer_pool.get_page_mx(page_id))
+        physical_indices = np.asarray(physical_indices, dtype=np.int64)
+        kv_head_indices = np.asarray(kv_head_indices, dtype=np.int64).reshape(num_heads)
+        pages = [None] * (num_heads * k)
+        for kv_head in np.unique(kv_head_indices):
+            head_indices = np.nonzero(kv_head_indices == kv_head)[0]
+            if head_indices.size == 0:
+                continue
+            pages_for_heads = physical_indices[head_indices]
+            union_pages, inverse = np.unique(pages_for_heads, return_inverse=True)
+            union_pages_mx = []
+            for page_idx in union_pages:
+                page_id = (layer_idx, int(page_idx), int(kv_head))
+                union_pages_mx.append(self.buffer_pool.get_page_mx(page_id))
+            pos = inverse.reshape(pages_for_heads.shape)
+            for local_idx, head_idx in enumerate(head_indices):
+                head_pos = pos[local_idx]
+                base = int(head_idx) * k
+                for j, union_idx in enumerate(head_pos):
+                    pages[base + j] = union_pages_mx[int(union_idx)]
         pages_mx = mx.stack(pages, axis=0)
         if pages_mx.dtype != dtype:
             pages_mx = pages_mx.astype(dtype)
@@ -695,7 +707,7 @@ class QuestController:
         
         max_kv_pages = (max_seq_len + page_size - 1) // page_size
         
-        # Using numpy for mutable access (Metadata is small enough to stay in RAM)
+        # Keep metadata on host (numpy) to avoid device memory growth.
         self.metadata_pool = np.zeros(
             (num_layers, max_kv_pages, 2, self.num_kv_heads, head_dim),
             dtype=np.float32
@@ -711,6 +723,10 @@ class QuestController:
         self._prefill_executor: Optional[ThreadPoolExecutor] = None
         self._prefill_buffers: Optional[List[np.ndarray]] = None
         self._prefill_buffer_spec: Optional[Tuple[int, int, int, int, np.dtype]] = None
+        self._metadata_mx_cache: Dict[int, mx.array] = {}
+        self._metadata_cache_len: Dict[int, int] = {}
+        self._metadata_kminmax_cache: Dict[int, Tuple[mx.array, mx.array]] = {}
+        self._metadata_kminmax_cache_len: Dict[int, int] = {}
         
     def set_page_budget(self, page_budget: int):
         self._page_budget = page_budget
@@ -729,12 +745,17 @@ class QuestController:
         """
         Updates metadata for a specific page.
         """
-        # k_min, k_max: (num_kv_heads, head_dim) - MLX arrays
-        k_min_np = np.array(k_min)
-        k_max_np = np.array(k_max)
-        
-        self.metadata_pool[layer_idx, page_idx, 0] = k_min_np
-        self.metadata_pool[layer_idx, page_idx, 1] = k_max_np
+        # k_min, k_max: (num_kv_heads, head_dim)
+        if not isinstance(k_min, np.ndarray):
+            k_min = np.asarray(k_min)
+        if not isinstance(k_max, np.ndarray):
+            k_max = np.asarray(k_max)
+        if k_min.dtype != np.float32:
+            k_min = k_min.astype(np.float32, copy=False)
+        if k_max.dtype != np.float32:
+            k_max = k_max.astype(np.float32, copy=False)
+        self.metadata_pool[layer_idx, page_idx, 0] = k_min
+        self.metadata_pool[layer_idx, page_idx, 1] = k_max
 
     def get_metadata_tensor(self, layer_idx: int, page_indices: List[int]) -> mx.array:
         """
@@ -742,12 +763,42 @@ class QuestController:
         """
         if not page_indices:
             return mx.array([])
-        
+        if page_indices is self.kv_indices_without_last:
+            cached_len = self._metadata_cache_len.get(layer_idx)
+            cached = self._metadata_mx_cache.get(layer_idx)
+            if cached is not None and cached_len == len(page_indices):
+                return cached
+
         data = self.metadata_pool[layer_idx, page_indices]
         # Transpose to (2, NumPages, H_kv, D) to match expected logic
-        data = data.transpose(1, 0, 2, 3)
-        return mx.array(data)
-        
+        tensor = mx.array(data.transpose(1, 0, 2, 3))
+        if page_indices is self.kv_indices_without_last:
+            self._metadata_mx_cache[layer_idx] = tensor
+            self._metadata_cache_len[layer_idx] = len(page_indices)
+        return tensor
+
+    def get_metadata_kminmax(
+        self,
+        layer_idx: int,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        Returns K_min/K_max shaped for estimate, cached by page count.
+        """
+        pages_indices = self.kv_indices_without_last
+        if not pages_indices:
+            empty = mx.zeros((self.num_kv_heads, 0, self.head_dim), dtype=mx.float32)
+            return empty, empty
+        cached_len = self._metadata_kminmax_cache_len.get(layer_idx)
+        cached = self._metadata_kminmax_cache.get(layer_idx)
+        if cached is not None and cached_len == len(pages_indices):
+            return cached
+        metadata = self.get_metadata_tensor(layer_idx, pages_indices)
+        k_min = metadata[0].transpose(1, 0, 2)
+        k_max = metadata[1].transpose(1, 0, 2)
+        self._metadata_kminmax_cache[layer_idx] = (k_min, k_max)
+        self._metadata_kminmax_cache_len[layer_idx] = len(pages_indices)
+        return k_min, k_max
+
     def begin_forward(self, seq_len: int):
         """
         Prepare indices for the forward pass.
@@ -766,6 +817,10 @@ class QuestController:
     def clean_states(self):
         self.kv_cache.release()
         self.close_prefill_resources()
+        self._metadata_mx_cache.clear()
+        self._metadata_cache_len.clear()
+        self._metadata_kminmax_cache.clear()
+        self._metadata_kminmax_cache_len.clear()
 
     def get_prefill_executor(self) -> ThreadPoolExecutor:
         if self._prefill_executor is None:
