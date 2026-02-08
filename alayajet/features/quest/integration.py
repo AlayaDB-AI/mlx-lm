@@ -105,48 +105,61 @@ class QuestFeature(AlayaFeature):
         replace_method(attn_cls, "__call__", quest_forward_factory)
         print(f"[Quest] Patched {attn_cls.__name__} with Quest Attention.")
 
+    def _build_controller(self):
+        if self.controller is not None:
+            return self.controller
+        config = self.config
+        if config is None:
+            return None
+
+        num_layers = config.num_hidden_layers
+        num_heads = config.num_attention_heads
+        hidden_size = config.hidden_size
+
+        if hasattr(config, "head_dim"):
+            head_dim = config.head_dim
+        elif hasattr(config, "attention_head_dim"):
+            head_dim = config.attention_head_dim
+        else:
+            head_dim = hidden_size // num_heads
+
+        num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
+        page_size = 64
+
+        self.controller = QuestController(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            page_budget=self.page_budget,
+            max_seq_len=self.max_seq_len,
+            num_kv_heads=num_kv_heads,
+            cache_dir=self.cache_dir,
+            dtype=mx.float16,
+            async_disk_write=self.async_disk_write,
+            disable_os_cache=self.disable_os_cache,
+            release_active_buffer_on_prefill=self.release_active_buffer_on_prefill,
+        )
+        self.controller.prefill_io_timing = self.log_prefill_io_overlap
+        self.controller._timing_hook = self.timing.record if self.timing.enabled else None
+        print(
+            f"[Quest] Controller Initialized: {self.page_budget} pages budget, "
+            f"disk cache at {self.cache_dir}"
+        )
+        return self.controller
+
+    def ensure_controller(self, cache_dir: str | None = None):
+        if cache_dir and cache_dir != self.cache_dir:
+            self.cache_dir = cache_dir
+            if self.controller is not None:
+                self.controller.close_prefill_resources()
+                self.controller.kv_cache.buffer_pool.close()
+                self.controller = None
+        return self._build_controller()
+
     def on_model_start(self, model):
-        # Initialize Controller if not ready or dimensions changed?
         if self.controller is None:
-            # Get dimensions from config or first layer
-            config = self.config
-            
-            num_layers = config.num_hidden_layers
-            num_heads = config.num_attention_heads
-            hidden_size = config.hidden_size
-            
-            # Determine head_dim: prefer config value, fallback to calculation
-            if hasattr(config, "head_dim"):
-                head_dim = config.head_dim
-            elif hasattr(config, "attention_head_dim"): # DeepSeek/Others
-                head_dim = config.attention_head_dim
-            else:
-                head_dim = hidden_size // num_heads
-            
-            # Identify KV heads
-            num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-            
-            # Page size - Quest default 64?
-            page_size = 64
-            
-            self.controller = QuestController(
-                num_layers=num_layers,
-                num_heads=num_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                page_budget=self.page_budget,
-                max_seq_len=self.max_seq_len,
-                num_kv_heads=num_kv_heads,
-                cache_dir=self.cache_dir,
-                dtype=mx.float16, # TODO: Match model dtype
-                async_disk_write=self.async_disk_write,
-                disable_os_cache=self.disable_os_cache,
-                release_active_buffer_on_prefill=self.release_active_buffer_on_prefill,
-            )
-            self.controller.prefill_io_timing = self.log_prefill_io_overlap
-            # Optional timing hook for fine-grained profiling.
-            self.controller._timing_hook = self.timing.record if self.timing.enabled else None
-            print(f"[Quest] Controller Initialized: {self.page_budget} pages budget, disk cache at {self.cache_dir}")
+            self._build_controller()
 
     def _format_mem(self, value: int | None) -> str:
         if value is None:

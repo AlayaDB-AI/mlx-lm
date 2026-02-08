@@ -342,6 +342,8 @@ class GenerationArguments:
     num_draft_tokens: int
     logprobs: int
     seed: Optional[int]
+    save_kv_cache_path: Optional[str] = None
+    load_kv_cache_path: Optional[str] = None
 
 
 @dataclass
@@ -965,6 +967,15 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
         self.seed = self.body.get("seed", None)
+        extra_body = self.body.get("extra_body", {})
+        if not isinstance(extra_body, dict):
+            extra_body = {}
+        self.save_kv_cache_path = self.body.get(
+            "save_kv_cache_path", extra_body.get("save_kv_cache_path")
+        )
+        self.load_kv_cache_path = self.body.get(
+            "load_kv_cache_path", extra_body.get("load_kv_cache_path")
+        )
         self.validate_model_parameters()
 
         # Get stop sequences
@@ -1170,6 +1181,8 @@ class APIHandler(BaseHTTPRequestHandler):
             num_draft_tokens=self.num_draft_tokens,
             logprobs=self.logprobs,
             seed=self.seed,
+            save_kv_cache_path=self.save_kv_cache_path,
+            load_kv_cache_path=self.load_kv_cache_path,
         )
 
         # Create keepalive callback to send SSE comments during long prompt processing

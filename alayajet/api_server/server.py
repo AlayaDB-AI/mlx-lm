@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import socket
+import time
 import warnings
 from http.server import ThreadingHTTPServer
 
@@ -11,7 +12,9 @@ import mlx.core as mx
 import mlx_lm.server as base_server
 
 from ..engine import AlayaEngine
+from .quest_kv_cache import QuestDiskCache
 from ..features.timing import TimingFeature
+from ..features.quest.integration import QuestFeature
 
 DEFAULT_PREFILL_STEP_SIZE = 8192
 DEFAULT_PAGE_BUDGET = 64
@@ -89,6 +92,7 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
     ):
         self.prefill_step_size = prefill_step_size
         self.allow_batch = allow_batch
+        self.quest_disk_cache = QuestDiskCache()
         super().__init__(model_provider, prompt_cache)
 
     def _is_batchable(self, args):
@@ -97,6 +101,15 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
         if getattr(self.model_provider.cli_args, "quest", False):
             return False
         return super()._is_batchable(args)
+
+    def _get_quest_feature(self):
+        engine = getattr(self.model_provider, "_engine", None)
+        if engine is None:
+            return None
+        for feature in engine.features:
+            if isinstance(feature, QuestFeature):
+                return feature
+        return None
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -136,57 +149,224 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
             sampler = base_server._make_sampler(args, tokenizer)
             logits_processors = base_server._make_logits_processors(args)
 
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
+            cache = None
+            rest = prompt
             cache_key = prompt[:]
-            if cache is None:
-                cache = base_server.make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += base_server.make_prompt_cache(self.model_provider.draft_model)
+            t_request_start = time.perf_counter()
+            first_prompt_tps = None
+            first_prompt_tokens = None
+            t_first_token = None
 
-            for gen in base_server.stream_generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=rest,
-                max_tokens=args.max_tokens,
-                sampler=sampler,
-                logits_processors=logits_processors,
-                prompt_cache=cache,
-                draft_model=draft_model,
-                num_draft_tokens=args.num_draft_tokens,
-                prompt_progress_callback=progress,
-                prefill_step_size=self.prefill_step_size,
-            ):
-                top_tokens = None
-                if args.logprobs > 0:
-                    sorted_indices = mx.argpartition(
-                        -gen.logprobs, kth=args.logprobs - 1
-                    )
-                    top_indices = sorted_indices[: args.logprobs]
-                    top_logprobs = gen.logprobs[top_indices]
-                    top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
-                    top_tokens = tuple(top_token_info)
+            load_path = getattr(args, "load_kv_cache_path", None)
+            save_path = getattr(args, "save_kv_cache_path", None)
+            model_id = args.model.model if args and args.model else None
 
-                rqueue.put(
-                    base_server.Response(
-                        gen.text,
-                        gen.token,
-                        gen.logprobs[gen.token].item(),
-                        gen.finish_reason,
-                        top_tokens,
-                    )
-                )
-                cache_key.append(gen.token)
-
-                if ctx._should_stop:
-                    break
-
-            rqueue.put(None)
-
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
+            quest_feature = self._get_quest_feature()
+            quest_controller = None
+            source_cache_dir = (
+                self.quest_disk_cache.resolve_cache_dir(load_path)
+                if load_path
+                else None
             )
+            if save_path:
+                working_cache_dir = self.quest_disk_cache.resolve_cache_dir(save_path)
+            elif load_path:
+                working_cache_dir = source_cache_dir
+            else:
+                working_cache_dir = self.model_provider.cli_args.cache_dir
+            quest_hit = False
+            if quest_feature is not None:
+                quest_controller = quest_feature.ensure_controller(
+                    cache_dir=working_cache_dir
+                )
+
+            prefix_len_for_restore = None
+            prefix_active_indices = None
+            backup_pages = None
+            backup_phys_page = None
+
+            try:
+                if quest_controller is not None and load_path:
+                    cached_tokens, rest, prefix_len = self.quest_disk_cache.load(
+                        quest_controller,
+                        load_path,
+                        prompt,
+                        model_id=model_id,
+                    )
+                    quest_hit = cached_tokens is not None
+                    if quest_hit:
+                        logging.info(
+                            "[QuestCache] hit path=%s prefix_len=%d prompt_len=%d rest=%d",
+                            load_path,
+                            prefix_len,
+                            len(prompt),
+                            len(rest),
+                        )
+                    else:
+                        logging.info("[QuestCache] miss path=%s", load_path)
+                    if quest_hit and save_path is None:
+                        kv_cache = quest_controller.kv_cache
+                        prefix_len_for_restore = prefix_len
+                        prefix_active_indices = list(kv_cache.active_indices)
+                        if prefix_len_for_restore > 0 and prefix_active_indices:
+                            if prefix_len_for_restore % kv_cache.page_size != 0:
+                                last_logical = (prefix_len_for_restore - 1) // kv_cache.page_size
+                                if last_logical < len(prefix_active_indices):
+                                    backup_phys_page = prefix_active_indices[last_logical]
+                                    backup_pages = []
+                                    pool = kv_cache.buffer_pool
+                                    for layer_idx in range(kv_cache.num_layers):
+                                        for kv_head in range(kv_cache.num_heads):
+                                            page_id = (layer_idx, backup_phys_page, kv_head)
+                                            offset = pool._page_offset(page_id)
+                                            data = os.pread(pool.fd, pool.page_bytes, offset)
+                                            if len(data) != pool.page_bytes:
+                                                raise RuntimeError(
+                                                    f"Short read for backup page {page_id}: "
+                                                    f"{len(data)} != {pool.page_bytes}"
+                                                )
+                                            backup_pages.append((offset, data))
+                if quest_controller is not None and (load_path or save_path) and not quest_hit:
+                    quest_controller.clean_states()
+
+                if cache is None:
+                    cache = base_server.make_prompt_cache(self.model_provider.model)
+                    if self.model_provider.draft_model is not None:
+                        cache += base_server.make_prompt_cache(self.model_provider.draft_model)
+
+                for gen in base_server.stream_generate(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt=rest,
+                    max_tokens=args.max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=cache,
+                    draft_model=draft_model,
+                    num_draft_tokens=args.num_draft_tokens,
+                    prompt_progress_callback=progress,
+                    prefill_step_size=self.prefill_step_size,
+                ):
+                    if first_prompt_tps is None:
+                        first_prompt_tps = gen.prompt_tps
+                        first_prompt_tokens = gen.prompt_tokens
+                        t_first_token = time.perf_counter()
+                    top_tokens = None
+                    if args.logprobs > 0:
+                        sorted_indices = mx.argpartition(
+                            -gen.logprobs, kth=args.logprobs - 1
+                        )
+                        top_indices = sorted_indices[: args.logprobs]
+                        top_logprobs = gen.logprobs[top_indices]
+                        top_token_info = zip(top_indices.tolist(), top_logprobs.tolist())
+                        top_tokens = tuple(top_token_info)
+
+                    rqueue.put(
+                        base_server.Response(
+                            gen.text,
+                            gen.token,
+                            gen.logprobs[gen.token].item(),
+                            gen.finish_reason,
+                            top_tokens,
+                        )
+                    )
+                    cache_key.append(gen.token)
+
+                    if ctx._should_stop:
+                        break
+
+                rqueue.put(None)
+                t_request_end = time.perf_counter()
+
+                # Persist Quest KV cache only when save path is provided.
+                save_target = save_path
+                if quest_controller is not None and save_target:
+                    self.quest_disk_cache.save(
+                        quest_controller,
+                        save_target,
+                        prompt_tokens=prompt,
+                        model_id=model_id,
+                    )
+
+                if load_path:
+                    gen_tokens = max(0, len(cache_key) - len(prompt))
+                    total_time = t_request_end - t_request_start
+                    prompt_time = None
+                    if first_prompt_tps and first_prompt_tokens:
+                        prompt_time = first_prompt_tokens / first_prompt_tps
+                    if prompt_time is not None:
+                        logging.info(
+                            "[QuestCache][Timing] prompt_tokens=%d prompt_time=%.3fs "
+                            "gen_tokens=%d total_time=%.3fs",
+                            first_prompt_tokens,
+                            prompt_time,
+                            gen_tokens,
+                            total_time,
+                        )
+                    else:
+                        logging.info(
+                            "[QuestCache][Timing] gen_tokens=%d total_time=%.3fs",
+                            gen_tokens,
+                            total_time,
+                        )
+            finally:
+                if (
+                    save_path is None
+                    and quest_controller is not None
+                    and prefix_active_indices is not None
+                    and prefix_len_for_restore is not None
+                ):
+                    kv_cache = quest_controller.kv_cache
+                    pool = kv_cache.buffer_pool
+                    current_active = list(kv_cache.active_indices)
+                    prefix_pages = len(prefix_active_indices)
+                    new_pages = current_active[prefix_pages:]
+
+                    def invalidate_phys(phys_page: int):
+                        for layer_idx in range(kv_cache.num_layers):
+                            for kv_head in range(kv_cache.num_heads):
+                                pool._invalidate_page((layer_idx, phys_page, kv_head))
+
+                    if backup_phys_page is not None:
+                        invalidate_phys(backup_phys_page)
+                    for phys_page in new_pages:
+                        invalidate_phys(phys_page)
+
+                    if backup_pages:
+                        for offset, data in backup_pages:
+                            written = os.pwrite(pool.fd, data, offset)
+                            if written != len(data):
+                                raise RuntimeError(
+                                    f"Short write when restoring kv_cache_pool.bin "
+                                    f"at offset {offset}: {written} != {len(data)}"
+                                )
+
+                    if new_pages:
+                        zero = b"\x00" * pool.page_bytes
+                        for phys_page in new_pages:
+                            for layer_idx in range(kv_cache.num_layers):
+                                for kv_head in range(kv_cache.num_heads):
+                                    offset = pool._page_offset(
+                                        (layer_idx, phys_page, kv_head)
+                                    )
+                                    written = os.pwrite(pool.fd, zero, offset)
+                                    if written != pool.page_bytes:
+                                        raise RuntimeError(
+                                            f"Short write when zeroing page "
+                                            f"({layer_idx}, {phys_page}, {kv_head}): "
+                                            f"{written} != {pool.page_bytes}"
+                                        )
+
+                    kv_cache.seq_len = prefix_len_for_restore
+                    kv_cache.active_indices = list(prefix_active_indices)
+                    kv_cache.free_slots = set(range(kv_cache.capacity)) - set(
+                        prefix_active_indices
+                    )
+                    kv_cache.active_buffers_mx.clear()
+                    kv_cache._last_page_written_layers.clear()
+                    kv_cache.page_cached_all.fill(False)
+                    if new_pages:
+                        quest_controller.metadata_pool[:, new_pages] = 0
 
         except Exception as e:
             rqueue.put(e)
@@ -354,20 +534,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow request batching (disabled by default to honor prefill step size).",
     )
-    parser.add_argument(
-        "--prompt-cache",
-        dest="prompt_cache",
-        action="store_true",
-        help="Enable prompt cache",
-    )
-    parser.add_argument(
-        "--no-prompt-cache",
-        dest="prompt_cache",
-        action="store_false",
-        help="Disable prompt cache (default)",
-    )
-    parser.set_defaults(prompt_cache=False)
-
     parser.add_argument("--quest", action="store_true", help="Enable Quest Feature")
     parser.set_defaults(quest=True)
     parser.add_argument(
@@ -513,11 +679,7 @@ def main():
         AlayaModelProvider(args),
         prefill_step_size=args.prefill_step_size,
         allow_batch=args.allow_batch,
-        prompt_cache=(
-            base_server.LRUPromptCache()
-            if args.prompt_cache
-            else NullPromptCache()
-        ),
+        prompt_cache=NullPromptCache(),
     )
 
 
