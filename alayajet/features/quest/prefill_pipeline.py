@@ -172,7 +172,7 @@ def prefill_with_kv_cache_pipelined(
     tail_len = prefix_len % page_size
 
     pool = controller.kv_cache.buffer_pool
-    _set_os_nocache(pool.fd, True)
+    _set_os_nocache(pool.fd, getattr(controller, "disable_os_cache", True))
 
     prefetch_future = None
     page_chunks = None

@@ -99,6 +99,7 @@ class AlayaEngine:
         log_memory: bool = False,
         log_memory_sync: bool = True,
         log_prefill_progress: bool = True,
+        disable_os_cache: bool = True,
     ):
         engine = cls()
         engine.add_feature(
@@ -118,6 +119,7 @@ class AlayaEngine:
                 log_memory=log_memory,
                 log_memory_sync=log_memory_sync,
                 log_prefill_progress=log_prefill_progress,
+                disable_os_cache=disable_os_cache,
             )
         )
         return engine

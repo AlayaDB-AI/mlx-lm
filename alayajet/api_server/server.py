@@ -14,6 +14,7 @@ from ..engine import AlayaEngine
 from ..features.timing import TimingFeature
 
 DEFAULT_PREFILL_STEP_SIZE = 8192
+DEFAULT_PAGE_BUDGET = 64
 
 
 class AlayaModelProvider(base_server.ModelProvider):
@@ -37,7 +38,11 @@ class AlayaModelProvider(base_server.ModelProvider):
         if self.cli_args.quest:
             self._maybe_clear_cache()
             self._engine = AlayaEngine.with_quest(
-                page_budget=self.cli_args.page_budget,
+                page_budget=(
+                    self.cli_args.page_budget
+                    if self.cli_args.page_budget is not None
+                    else DEFAULT_PAGE_BUDGET
+                ),
                 cache_dir=self.cli_args.cache_dir,
                 async_disk_write=self.cli_args.quest_async_disk_write,
                 timing=self.cli_args.quest_timing,
@@ -50,6 +55,7 @@ class AlayaModelProvider(base_server.ModelProvider):
                 log_memory=self.cli_args.quest_mem_log,
                 log_memory_sync=self.cli_args.quest_timing_sync,
                 log_prefill_progress=True,
+                disable_os_cache=self.cli_args.quest_disable_os_cache,
             )
         elif self.cli_args.timing:
             self._engine = AlayaEngine()
@@ -186,6 +192,14 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
             rqueue.put(e)
 
 
+class NullPromptCache:
+    def fetch_nearest_cache(self, model, tokens):
+        return None, tokens
+
+    def insert_cache(self, model, tokens, prompt_cache):
+        return None
+
+
 def run(
     host: str,
     port: int,
@@ -193,13 +207,14 @@ def run(
     *,
     prefill_step_size: int,
     allow_batch: bool,
+    prompt_cache,
     server_class=ThreadingHTTPServer,
     handler_class=base_server.APIHandler,
 ):
     server_address = (host, port)
     response_generator = AlayaResponseGenerator(
         model_provider,
-        base_server.LRUPromptCache(),
+        prompt_cache,
         prefill_step_size=prefill_step_size,
         allow_batch=allow_batch,
     )
@@ -291,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use the default chat template",
     )
+    parser.set_defaults(use_default_chat_template=True)
     parser.add_argument(
         "--temp",
         type=float,
@@ -338,10 +354,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow request batching (disabled by default to honor prefill step size).",
     )
+    parser.add_argument(
+        "--prompt-cache",
+        dest="prompt_cache",
+        action="store_true",
+        help="Enable prompt cache",
+    )
+    parser.add_argument(
+        "--no-prompt-cache",
+        dest="prompt_cache",
+        action="store_false",
+        help="Disable prompt cache (default)",
+    )
+    parser.set_defaults(prompt_cache=False)
 
     parser.add_argument("--quest", action="store_true", help="Enable Quest Feature")
+    parser.set_defaults(quest=True)
     parser.add_argument(
-        "--page-budget", type=int, default=64, help="Quest page budget"
+        "--page-budget",
+        type=int,
+        default=DEFAULT_PAGE_BUDGET,
+        help="Quest page budget",
     )
     parser.add_argument(
         "--cache-dir",
@@ -361,6 +394,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not clear the Quest cache directory on startup (default)",
     )
     parser.set_defaults(quest_reset_cache=False)
+    parser.set_defaults(quest_disable_os_cache=True)
     parser.add_argument(
         "--quest-async-disk-write",
         dest="quest_async_disk_write",
@@ -373,6 +407,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="quest_async_disk_write",
         action="store_false",
         help="Disable async disk write for Quest",
+    )
+    parser.add_argument(
+        "--quest-disable-os-cache",
+        dest="quest_disable_os_cache",
+        action="store_true",
+        help="Disable OS page cache for Quest KV backing file (default)",
+    )
+    parser.add_argument(
+        "--quest-enable-os-cache",
+        dest="quest_disable_os_cache",
+        action="store_false",
+        help="Allow OS page cache for Quest KV backing file",
     )
     parser.add_argument("--timing", action="store_true", help="Enable baseline timing")
     parser.add_argument(
@@ -467,6 +513,11 @@ def main():
         AlayaModelProvider(args),
         prefill_step_size=args.prefill_step_size,
         allow_batch=args.allow_batch,
+        prompt_cache=(
+            base_server.LRUPromptCache()
+            if args.prompt_cache
+            else NullPromptCache()
+        ),
     )
 
 

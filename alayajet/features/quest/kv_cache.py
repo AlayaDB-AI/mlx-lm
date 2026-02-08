@@ -5,7 +5,7 @@ import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
-from typing import List, Optional, Tuple, Dict, Set
+from typing import List, Optional, Tuple, Dict, Set, Callable
 
 try:
     import fcntl
@@ -31,6 +31,7 @@ class BufferPool:
         num_frames: int,
         async_write: bool = False,
         disable_os_cache: bool = True,
+        on_evict: Optional[Callable[[Tuple[int, int, int]], None]] = None,
     ):
         self.backing_file = backing_file
         self.num_layers = num_layers
@@ -66,8 +67,25 @@ class BufferPool:
         self.frame_mx_cache: List[Optional[mx.array]] = [None] * self.num_frames
 
         self.page_table: Dict[Tuple[int, int, int], int] = {}
-        self.lru = OrderedDict()
-        self.free_list = list(range(self.num_frames))
+        # Partition LRU by layer to avoid cross-layer eviction.
+        if self.num_frames < self.num_layers:
+            raise ValueError(
+                "num_frames must be >= num_layers for layer-partitioned LRU"
+            )
+        frames_per_layer = self.num_frames // self.num_layers
+        remainder = self.num_frames % self.num_layers
+        self._layer_frame_offsets: List[int] = []
+        self._layer_frame_counts: List[int] = []
+        self.lru: List[OrderedDict] = []
+        self.free_list: List[List[int]] = []
+        base = 0
+        for layer_idx in range(self.num_layers):
+            count = frames_per_layer + (1 if layer_idx < remainder else 0)
+            self._layer_frame_offsets.append(base)
+            self._layer_frame_counts.append(count)
+            self.lru.append(OrderedDict())
+            self.free_list.append(list(range(base, base + count)))
+            base += count
 
         self.read_bytes = 0
         self.write_bytes = 0
@@ -77,6 +95,7 @@ class BufferPool:
         self._write_queue: Optional[queue.Queue] = None
         self._write_thread: Optional[threading.Thread] = None
         self.async_write = async_write
+        self._on_evict = on_evict
         if async_write:
             self._write_queue = queue.Queue()
             self._write_thread = threading.Thread(
@@ -101,6 +120,27 @@ class BufferPool:
         frame[...] = frame_view
         self.read_bytes += self.page_bytes
 
+    def _read_pages_all_heads(
+        self,
+        layer_idx: int,
+        page_start: int,
+        page_count: int,
+    ) -> np.ndarray:
+        if page_count <= 0:
+            return np.empty((0, self.num_heads, *self.frame_shape), dtype=self.dtype)
+        offset = self._page_offset((layer_idx, page_start, 0))
+        total_bytes = page_count * self.num_heads * self.page_bytes
+        data = os.pread(self.fd, total_bytes, offset)
+        if len(data) != total_bytes:
+            raise RuntimeError(
+                f"Short read for pages {page_start}:{page_start + page_count} "
+                f"(layer {layer_idx}): {len(data)} != {total_bytes}"
+            )
+        self.read_bytes += total_bytes
+        return np.frombuffer(data, dtype=self.dtype).reshape(
+            page_count, self.num_heads, *self.frame_shape
+        )
+
     def _write_page(self, page_id: Tuple[int, int, int], frame: np.ndarray):
         offset = self._page_offset(page_id)
         written = os.pwrite(self.fd, frame, offset)
@@ -114,13 +154,17 @@ class BufferPool:
         frame_idx = self.page_table.get(page_id)
         if frame_idx is None:
             return
-        if page_id in self.lru:
-            del self.lru[page_id]
+        layer_idx = page_id[0]
+        layer_lru = self.lru[layer_idx]
+        if page_id in layer_lru:
+            del layer_lru[page_id]
         del self.page_table[page_id]
         self.frame_dirty[frame_idx] = False
         self.frame_page_id[frame_idx] = None
         self.frame_mx_cache[frame_idx] = None
-        self.free_list.append(frame_idx)
+        self.free_list[layer_idx].append(frame_idx)
+        if self._on_evict is not None:
+            self._on_evict(page_id)
 
     def write_page_direct(self, page_id: Tuple[int, int, int], frame: np.ndarray):
         frame_np = np.ascontiguousarray(frame, dtype=self.dtype)
@@ -166,8 +210,13 @@ class BufferPool:
                 self.write_bytes += size
             self._write_queue.task_done()
 
-    def _evict_frame(self) -> int:
-        page_id, frame_idx = self.lru.popitem(last=False)
+    def _evict_frame(self, layer_idx: int) -> int:
+        layer_lru = self.lru[layer_idx]
+        if not layer_lru:
+            raise RuntimeError(f"LRU empty for layer {layer_idx}; cannot evict")
+        page_id, frame_idx = layer_lru.popitem(last=False)
+        if self._on_evict is not None:
+            self._on_evict(page_id)
         if self.frame_dirty[frame_idx]:
             self._enqueue_write(page_id, self.frames[frame_idx])
             self.frame_dirty[frame_idx] = False
@@ -176,14 +225,16 @@ class BufferPool:
         self.frame_mx_cache[frame_idx] = None
         return frame_idx
 
-    def _alloc_frame(self) -> int:
-        if self.free_list:
-            return self.free_list.pop()
-        return self._evict_frame()
+    def _alloc_frame(self, layer_idx: int) -> int:
+        layer_free = self.free_list[layer_idx]
+        if layer_free:
+            return layer_free.pop()
+        return self._evict_frame(layer_idx)
 
     def _touch(self, page_id: Tuple[int, int, int]):
-        if page_id in self.lru:
-            self.lru.move_to_end(page_id, last=True)
+        layer_lru = self.lru[page_id[0]]
+        if page_id in layer_lru:
+            layer_lru.move_to_end(page_id, last=True)
 
     def has_page(self, page_id: Tuple[int, int, int]) -> bool:
         return page_id in self.page_table
@@ -195,10 +246,11 @@ class BufferPool:
             self._touch(page_id)
             return frame_idx
         self.misses += 1
-        frame_idx = self._alloc_frame()
+        layer_idx = page_id[0]
+        frame_idx = self._alloc_frame(layer_idx)
         self.page_table[page_id] = frame_idx
         self.frame_page_id[frame_idx] = page_id
-        self.lru[page_id] = frame_idx
+        self.lru[layer_idx][page_id] = frame_idx
         if assume_zero:
             self.frames[frame_idx].fill(0)
         else:
@@ -290,8 +342,13 @@ class BufferPool:
     def reset(self):
         self.flush()
         self.page_table.clear()
-        self.lru.clear()
-        self.free_list = list(range(self.num_frames))
+        for layer_lru in self.lru:
+            layer_lru.clear()
+        self.free_list = []
+        base = 0
+        for count in self._layer_frame_counts:
+            self.free_list.append(list(range(base, base + count)))
+            base += count
         self.frame_dirty = [False] * self.num_frames
         self.frame_page_id = [None] * self.num_frames
         self.frame_mx_cache = [None] * self.num_frames
@@ -372,6 +429,7 @@ class DiskOffloadKvCache:
             num_frames=num_frames,
             async_write=self.async_disk_write,
             disable_os_cache=disable_os_cache,
+            on_evict=self._on_buffer_pool_evict,
         )
         
         # Track free blocks (simple stack allocator)
@@ -383,6 +441,7 @@ class DiskOffloadKvCache:
         # Active buffers in MX: layer_idx -> mx.array
         self.active_buffers_mx: Dict[int, mx.array] = {}
         self._last_page_written_layers: Set[int] = set()
+        self.page_cached_all = np.zeros((num_layers, self.capacity), dtype=np.bool_)
         
         self.seq_len = 0
 
@@ -445,6 +504,8 @@ class DiskOffloadKvCache:
                 self.buffer_pool.write_page_direct(page_id, head_slice)
             else:
                 self.buffer_pool.write_page(page_id, head_slice)
+        if not self.write_through:
+            self.page_cached_all[layer_idx, page_idx] = True
 
     def _write_active_buffer_page_async(self, layer_idx: int, page_idx: int, buffer_mx: mx.array):
         buffer_np = np.array(buffer_mx)
@@ -457,6 +518,8 @@ class DiskOffloadKvCache:
                 self.buffer_pool.write_page_direct(page_id, head_slice)
             else:
                 self.buffer_pool.write_page_async(page_id, head_slice)
+        if not self.write_through:
+            self.page_cached_all[layer_idx, page_idx] = True
 
     def flush_active_buffers(self, page_idx: int):
         """Writes active buffers to buffer pool."""
@@ -530,7 +593,31 @@ class DiskOffloadKvCache:
         page_mx = mx.stack(heads, axis=2)
         if page_mx.dtype != self.mx_dtype:
             page_mx = page_mx.astype(self.mx_dtype)
+        self.page_cached_all[layer_idx, page_idx] = True
         return page_mx
+
+    def _read_pages_all_heads_into_cache(
+        self,
+        layer_idx: int,
+        run_start: int,
+        run_end: int,
+    ) -> None:
+        page_count = run_end - run_start + 1
+        if page_count <= 0:
+            return
+        pages_np = self.buffer_pool._read_pages_all_heads(
+            layer_idx,
+            run_start,
+            page_count,
+        )
+        for i in range(page_count):
+            page_idx = run_start + i
+            for kv_head in range(self.num_heads):
+                page_id = (layer_idx, page_idx, kv_head)
+                if self.buffer_pool.has_page(page_id):
+                    continue
+                self.buffer_pool.insert_page_cache(page_id, pages_np[i, kv_head])
+            self.page_cached_all[layer_idx, page_idx] = True
 
     def load_kv_slices(
         self,
@@ -574,6 +661,23 @@ class DiskOffloadKvCache:
             return empty, empty
         physical_indices = np.asarray(physical_indices, dtype=np.int64)
         kv_head_indices = np.asarray(kv_head_indices, dtype=np.int64).reshape(num_heads)
+        # Batch read contiguous pages and warm all KV heads for missing pages.
+        union_pages_all = np.unique(physical_indices)
+        if union_pages_all.size:
+            cached_mask = self.page_cached_all[layer_idx, union_pages_all]
+            if not cached_mask.all():
+                missing_pages = union_pages_all[~cached_mask]
+                missing_pages = np.sort(missing_pages)
+                run_start = int(missing_pages[0])
+                run_end = run_start
+                for page_idx in missing_pages[1:]:
+                    page_idx = int(page_idx)
+                    if page_idx == run_end + 1:
+                        run_end = page_idx
+                        continue
+                    self._read_pages_all_heads_into_cache(layer_idx, run_start, run_end)
+                    run_start = run_end = page_idx
+                self._read_pages_all_heads_into_cache(layer_idx, run_start, run_end)
         pages = [None] * (num_heads * k)
         for kv_head in np.unique(kv_head_indices):
             head_indices = np.nonzero(kv_head_indices == kv_head)[0]
@@ -634,6 +738,10 @@ class DiskOffloadKvCache:
                     v_slice=v_slice,
                     assume_zero=assume_zero,
                 )
+        if write_through:
+            self.page_cached_all[layer_idx, page_idx] = False
+        else:
+            self.page_cached_all[layer_idx, page_idx] = True
 
     def release(self):
         self.buffer_pool.reset()
@@ -643,6 +751,12 @@ class DiskOffloadKvCache:
         self.active_indices.clear()
         self.active_buffers_mx.clear()
         self._last_page_written_layers.clear()
+        self.page_cached_all.fill(False)
+
+    def _on_buffer_pool_evict(self, page_id: Tuple[int, int, int]):
+        layer_idx, page_idx, _ = page_id
+        if 0 <= layer_idx < self.page_cached_all.shape[0] and 0 <= page_idx < self.page_cached_all.shape[1]:
+            self.page_cached_all[layer_idx, page_idx] = False
 
     def pop_lru_stats(self) -> Tuple[int, int]:
         return self.buffer_pool.pop_lru_stats()
@@ -675,6 +789,7 @@ class QuestController:
         self.page_size = page_size
         self._page_budget = page_budget
         self.dtype = dtype
+        self.disable_os_cache = disable_os_cache
         if buffer_pool_pages is None:
             group_size = max(1, self.num_heads // self.num_kv_heads)
             buffer_pool_pages = page_budget * group_size * 2

@@ -112,6 +112,19 @@ def main():
         action="store_true",
         help="Log Quest memory checkpoints during prefill"
     )
+    parser.add_argument(
+        "--quest-disable-os-cache",
+        dest="quest_disable_os_cache",
+        action="store_true",
+        help="Disable OS page cache for Quest KV backing file (default)"
+    )
+    parser.add_argument(
+        "--quest-enable-os-cache",
+        dest="quest_disable_os_cache",
+        action="store_false",
+        help="Allow OS page cache for Quest KV backing file"
+    )
+    parser.set_defaults(quest_disable_os_cache=True)
     args = parser.parse_args()
     
     if not os.path.exists(args.data_path):
@@ -150,6 +163,7 @@ def main():
             log_memory=args.quest_mem_log,
             log_memory_sync=args.quest_timing_sync,
             log_prefill_progress=True,
+            disable_os_cache=args.quest_disable_os_cache,
         )
         
         # from alayajet.features.chunking import ChunkComputationFeature

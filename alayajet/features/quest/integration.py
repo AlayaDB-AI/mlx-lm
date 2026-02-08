@@ -28,6 +28,7 @@ class QuestFeature(AlayaFeature):
         log_memory: bool = False,
         log_memory_sync: bool = True,
         log_prefill_progress: bool = True,
+        disable_os_cache: bool = True,
     ):
         super().__init__()
         self.page_budget = page_budget
@@ -47,6 +48,7 @@ class QuestFeature(AlayaFeature):
         self.log_memory = log_memory
         self.log_memory_sync = log_memory_sync
         self.log_prefill_progress = log_prefill_progress
+        self.disable_os_cache = disable_os_cache
         self.controller = None
         self.max_seq_len = 32768 # Default max, can be inferred from config
         self.config = None
@@ -138,6 +140,7 @@ class QuestFeature(AlayaFeature):
                 cache_dir=self.cache_dir,
                 dtype=mx.float16, # TODO: Match model dtype
                 async_disk_write=self.async_disk_write,
+                disable_os_cache=self.disable_os_cache,
                 release_active_buffer_on_prefill=self.release_active_buffer_on_prefill,
             )
             self.controller.prefill_io_timing = self.log_prefill_io_overlap
