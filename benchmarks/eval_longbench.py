@@ -116,15 +116,15 @@ def main():
         "--quest-disable-os-cache",
         dest="quest_disable_os_cache",
         action="store_true",
-        help="Disable OS page cache for Quest KV backing file (default)"
+        help="Disable OS page cache for Quest KV backing file"
     )
     parser.add_argument(
         "--quest-enable-os-cache",
         dest="quest_disable_os_cache",
         action="store_false",
-        help="Allow OS page cache for Quest KV backing file"
+        help="Allow OS page cache for Quest KV backing file (default)"
     )
-    parser.set_defaults(quest_disable_os_cache=True)
+    parser.set_defaults(quest_disable_os_cache=False)
     args = parser.parse_args()
     
     if not os.path.exists(args.data_path):

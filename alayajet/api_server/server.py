@@ -560,7 +560,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not clear the Quest cache directory on startup (default)",
     )
     parser.set_defaults(quest_reset_cache=False)
-    parser.set_defaults(quest_disable_os_cache=True)
+    parser.set_defaults(quest_disable_os_cache=False)
     parser.add_argument(
         "--quest-async-disk-write",
         dest="quest_async_disk_write",
@@ -578,13 +578,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--quest-disable-os-cache",
         dest="quest_disable_os_cache",
         action="store_true",
-        help="Disable OS page cache for Quest KV backing file (default)",
+        help="Disable OS page cache for Quest KV backing file",
     )
     parser.add_argument(
         "--quest-enable-os-cache",
         dest="quest_disable_os_cache",
         action="store_false",
-        help="Allow OS page cache for Quest KV backing file",
+        help="Allow OS page cache for Quest KV backing file (default)",
     )
     parser.add_argument("--timing", action="store_true", help="Enable baseline timing")
     parser.add_argument(
