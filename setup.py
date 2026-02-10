@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +12,8 @@ sys.path.append(str(package_dir))
 from _version import __version__
 
 MIN_MLX_VERSION = "0.29.2"
+LOCAL_MLX_PATH = (Path(__file__).parent / "3rdparty" / "mlx").resolve()
+mlx_requirement = f"mlx @ file://{LOCAL_MLX_PATH.as_posix()}"
 
 setup(
     name="mlx-lm",
@@ -24,7 +27,7 @@ setup(
     url="https://github.com/ml-explore/mlx-lm",
     license="MIT",
     install_requires=[
-        f"mlx>={MIN_MLX_VERSION}; platform_system == 'Darwin'",
+        mlx_requirement,
         "huggingface_hub",
         "numpy",
         "transformers==5.0.0rc1",
@@ -34,6 +37,10 @@ setup(
         "jinja2",
     ],
     packages=[
+        "alayajet",
+        "alayajet.api_server",
+        "alayajet.features",
+        "alayajet.features.quest",
         "mlx_lm",
         "mlx_lm.models",
         "mlx_lm.quant",
