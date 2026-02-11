@@ -232,19 +232,22 @@ def _download(
             "*.jsonl",
             "*.jinja",
         ]
-        model_path = Path(
-            snapshot_download(
-                path_or_hf_repo,
-                revision=revision,
-                allow_patterns=allow_patterns,
-            )
-        )
+        download_kwargs = {
+            "revision": revision,
+            "allow_patterns": allow_patterns,
+        }
+        if "endpoint" in inspect.signature(snapshot_download).parameters:
+            download_kwargs["endpoint"] = os.environ.get("HF_ENDPOINT")
+        model_path = Path(snapshot_download(path_or_hf_repo, **download_kwargs))
 
     return model_path
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    download_kwargs = {"local_files_only": True}
+    if "endpoint" in inspect.signature(snapshot_download).parameters:
+        download_kwargs["endpoint"] = os.environ.get("HF_ENDPOINT")
+    return Path(snapshot_download(hf_repo, **download_kwargs))
 
 
 def load_config(model_path: Path) -> dict:
