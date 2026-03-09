@@ -1,7 +1,7 @@
 import time
 import mlx.core as mx
 import numpy as np
-from .kv_cache import QuestController
+from .kv_cache import QuestController, safe_to_numpy
 
 def apply_rope_in_place(
     q: mx.array,
@@ -73,12 +73,8 @@ def append_kv(
             else:
                 prev_min = controller.metadata_pool[layer_idx, phys_page_idx, 0]
                 prev_max = controller.metadata_pool[layer_idx, phys_page_idx, 1]
-                chunk_k_min_np = np.asarray(chunk_k_min)
-                chunk_k_max_np = np.asarray(chunk_k_max)
-                if chunk_k_min_np.dtype != np.float32:
-                    chunk_k_min_np = chunk_k_min_np.astype(np.float32, copy=False)
-                if chunk_k_max_np.dtype != np.float32:
-                    chunk_k_max_np = chunk_k_max_np.astype(np.float32, copy=False)
+                chunk_k_min_np = safe_to_numpy(chunk_k_min, dtype=np.float32)
+                chunk_k_max_np = safe_to_numpy(chunk_k_max, dtype=np.float32)
                 new_min = np.minimum(prev_min, chunk_k_min_np)
                 new_max = np.maximum(prev_max, chunk_k_max_np)
                 controller.update_metadata(layer_idx, phys_page_idx, new_min, new_max)
@@ -86,12 +82,8 @@ def append_kv(
         else:
             physical_block_idx = controller.kv_cache.active_indices[page_idx]
             
-            k_np = np.array(k_chunk)
-            v_np = np.array(v_chunk)
-            if k_np.dtype != controller.kv_cache.dtype:
-                k_np = k_np.astype(controller.kv_cache.dtype, copy=False)
-            if v_np.dtype != controller.kv_cache.dtype:
-                v_np = v_np.astype(controller.kv_cache.dtype, copy=False)
+            k_np = safe_to_numpy(k_chunk, dtype=controller.kv_cache.dtype)
+            v_np = safe_to_numpy(v_chunk, dtype=controller.kv_cache.dtype)
             controller.kv_cache.write_kv_slice(
                 layer_idx=layer_idx,
                 page_idx=physical_block_idx,
@@ -116,12 +108,8 @@ def append_kv(
                 prev_min = controller.metadata_pool[layer_idx][physical_block_idx, 0]
                 prev_max = controller.metadata_pool[layer_idx][physical_block_idx, 1]
                 
-                chunk_k_min_np = np.asarray(chunk_k_min)
-                chunk_k_max_np = np.asarray(chunk_k_max)
-                if chunk_k_min_np.dtype != np.float32:
-                    chunk_k_min_np = chunk_k_min_np.astype(np.float32, copy=False)
-                if chunk_k_max_np.dtype != np.float32:
-                    chunk_k_max_np = chunk_k_max_np.astype(np.float32, copy=False)
+                chunk_k_min_np = safe_to_numpy(chunk_k_min, dtype=np.float32)
+                chunk_k_max_np = safe_to_numpy(chunk_k_max, dtype=np.float32)
                 new_min = np.minimum(prev_min, chunk_k_min_np)
                 new_max = np.maximum(prev_max, chunk_k_max_np)
                 

@@ -13,6 +13,50 @@ except Exception:  # pragma: no cover - optional on some platforms
     fcntl = None
 
 
+_NUMPY_TO_MX_DTYPE = {
+    np.dtype(np.float16): mx.float16,
+    np.dtype(np.float32): mx.float32,
+    np.dtype(np.int32): mx.int32,
+    np.dtype(np.int64): mx.int64,
+    np.dtype(np.bool_): mx.bool_,
+}
+
+
+def safe_to_numpy(value, dtype=None, copy: bool = False) -> np.ndarray:
+    """Convert MLX tensors to NumPy without relying on fragile buffer exports.
+
+    Some MLX tensors, notably bf16-backed intermediates seen on Qwen3 + Quest,
+    can fail under ``np.array(mx_tensor)`` with a PEP 3118 buffer mismatch. When
+    a target NumPy dtype is known, cast through the corresponding MLX dtype
+    first; otherwise fall back to ``tolist()`` as a correctness-first path.
+    """
+    target_dtype = np.dtype(dtype) if dtype is not None else None
+
+    if isinstance(value, np.ndarray):
+        array = value
+    else:
+        if target_dtype is not None and hasattr(value, "astype"):
+            mx_dtype = _NUMPY_TO_MX_DTYPE.get(target_dtype)
+            if mx_dtype is not None:
+                value = value.astype(mx_dtype)
+        try:
+            mx.eval(value)
+        except Exception:
+            pass
+        try:
+            array = np.asarray(value)
+        except (RuntimeError, TypeError, ValueError):
+            if not hasattr(value, "tolist"):
+                raise
+            array = np.asarray(value.tolist())
+
+    if target_dtype is not None and array.dtype != target_dtype:
+        array = array.astype(target_dtype, copy=False)
+    if copy:
+        array = np.array(array, copy=True)
+    return array
+
+
 class BufferPool:
     """
     User-space buffer pool for head-sliced KV pages.
@@ -494,9 +538,7 @@ class DiskOffloadKvCache:
         return appended_page_count
     
     def _write_active_buffer_page(self, layer_idx: int, page_idx: int, buffer_mx: mx.array):
-        buffer_np = np.array(buffer_mx)
-        if buffer_np.dtype != self.dtype:
-            buffer_np = buffer_np.astype(self.dtype, copy=False)
+        buffer_np = safe_to_numpy(buffer_mx, dtype=self.dtype)
         for kv_head in range(self.num_heads):
             page_id = (layer_idx, page_idx, kv_head)
             head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
@@ -508,9 +550,7 @@ class DiskOffloadKvCache:
             self.page_cached_all[layer_idx, page_idx] = True
 
     def _write_active_buffer_page_async(self, layer_idx: int, page_idx: int, buffer_mx: mx.array):
-        buffer_np = np.array(buffer_mx)
-        if buffer_np.dtype != self.dtype:
-            buffer_np = buffer_np.astype(self.dtype, copy=False)
+        buffer_np = safe_to_numpy(buffer_mx, dtype=self.dtype)
         for kv_head in range(self.num_heads):
             page_id = (layer_idx, page_idx, kv_head)
             head_slice = np.ascontiguousarray(buffer_np[:, :, kv_head, :])
@@ -792,7 +832,7 @@ class QuestController:
         self.disable_os_cache = disable_os_cache
         if buffer_pool_pages is None:
             group_size = max(1, self.num_heads // self.num_kv_heads)
-            buffer_pool_pages = page_budget * group_size * 2
+            buffer_pool_pages = page_budget * group_size * 4
         buffer_pool_pages = max(1, buffer_pool_pages)
         
         # Main KV Cache (Disk Backed)
@@ -861,14 +901,8 @@ class QuestController:
         Updates metadata for a specific page.
         """
         # k_min, k_max: (num_kv_heads, head_dim)
-        if not isinstance(k_min, np.ndarray):
-            k_min = np.asarray(k_min)
-        if not isinstance(k_max, np.ndarray):
-            k_max = np.asarray(k_max)
-        if k_min.dtype != np.float32:
-            k_min = k_min.astype(np.float32, copy=False)
-        if k_max.dtype != np.float32:
-            k_max = k_max.astype(np.float32, copy=False)
+        k_min = safe_to_numpy(k_min, dtype=np.float32)
+        k_max = safe_to_numpy(k_max, dtype=np.float32)
         self.metadata_pool[layer_idx, page_idx, 0] = k_min
         self.metadata_pool[layer_idx, page_idx, 1] = k_max
 

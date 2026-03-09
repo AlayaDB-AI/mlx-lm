@@ -179,6 +179,12 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
                 quest_controller = quest_feature.ensure_controller(
                     cache_dir=working_cache_dir
                 )
+                # Treat regular API requests as request-scoped Quest sessions.
+                # Without this reset, a prior large request leaves KV/metadata
+                # state behind and can make later short prompts pay for stale
+                # pages from earlier requests.
+                if not load_path and not save_path:
+                    quest_controller.clean_states()
 
             prefix_len_for_restore = None
             prefix_active_indices = None
@@ -288,16 +294,25 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
                         model_id=model_id,
                     )
 
-                if load_path:
+                # Timing log for KV cache workflows (save/load) so we can compare
+                # end-to-end request latency between the first (save/miss) and
+                # subsequent (load/hit) requests.
+                if load_path or save_path:
                     gen_tokens = max(0, len(cache_key) - len(prompt))
                     total_time = t_request_end - t_request_start
                     prompt_time = None
                     if first_prompt_tps and first_prompt_tokens:
                         prompt_time = first_prompt_tokens / first_prompt_tps
+                    if load_path:
+                        op = "load_hit" if quest_hit else "load_miss"
+                    else:
+                        op = "save"
+
                     if prompt_time is not None:
                         logging.info(
-                            "[QuestCache][Timing] prompt_tokens=%d prompt_time=%.3fs "
+                            "[QuestCache][Timing] op=%s prompt_tokens=%d prompt_time=%.3fs "
                             "gen_tokens=%d total_time=%.3fs",
+                            op,
                             first_prompt_tokens,
                             prompt_time,
                             gen_tokens,
@@ -305,7 +320,8 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
                         )
                     else:
                         logging.info(
-                            "[QuestCache][Timing] gen_tokens=%d total_time=%.3fs",
+                            "[QuestCache][Timing] op=%s gen_tokens=%d total_time=%.3fs",
+                            op,
                             gen_tokens,
                             total_time,
                         )
@@ -367,6 +383,8 @@ class AlayaResponseGenerator(base_server.ResponseGenerator):
                     kv_cache.page_cached_all.fill(False)
                     if new_pages:
                         quest_controller.metadata_pool[:, new_pages] = 0
+                elif quest_controller is not None and not load_path and not save_path:
+                    quest_controller.clean_states()
 
         except Exception as e:
             rqueue.put(e)
