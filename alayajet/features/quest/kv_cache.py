@@ -882,6 +882,7 @@ class QuestController:
         self._metadata_cache_len: Dict[int, int] = {}
         self._metadata_kminmax_cache: Dict[int, Tuple[mx.array, mx.array]] = {}
         self._metadata_kminmax_cache_len: Dict[int, int] = {}
+        self._metal_sparse_cache: Dict[Tuple[int, Tuple[int, ...]], Tuple[mx.array, mx.array, mx.array]] = {}
         
     def set_page_budget(self, page_budget: int):
         self._page_budget = page_budget
@@ -970,6 +971,7 @@ class QuestController:
         self._metadata_cache_len.clear()
         self._metadata_kminmax_cache.clear()
         self._metadata_kminmax_cache_len.clear()
+        self._metal_sparse_cache.clear()
 
     def get_prefill_executor(self) -> ThreadPoolExecutor:
         if self._prefill_executor is None:

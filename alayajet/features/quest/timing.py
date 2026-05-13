@@ -42,9 +42,11 @@ class QuestTiming:
             "decode_disk_read",
             "decode_last_page",
             "decode_stream_attn",
+            "decode_fused_metal_sparse_attn",
         }
         self._trace_hidden_keys = {
             "decode_sparse_attn",
+            "decode_fused_metal_sparse_attn",
         }
 
     def record(self, key: str, start_time: float, *sync_arrays):
@@ -121,6 +123,7 @@ class QuestTiming:
             "decode_append_kv",
             "decode_estimate_topk",
             "decode_sparse_attn",
+            "decode_fused_metal_sparse_attn",
         ):
             fmt_line(key, denom=total_time)
 

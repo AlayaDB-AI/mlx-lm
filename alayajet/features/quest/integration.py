@@ -1,3 +1,4 @@
+import os
 import mlx.core as mx
 import time
 import sys
@@ -334,7 +335,13 @@ class QuestFeature(AlayaFeature):
             # 1. Estimate
             # q_in: (1, H, D)
             need_estimate = self.controller.need_estimate()
-            if need_estimate:
+            scores = None
+            use_fused_metal_sparse = (
+                os.environ.get("ALAYAJET_QUEST_METAL_SPARSE") == "1"
+            )
+            if need_estimate and use_fused_metal_sparse:
+                topk = np.empty((q_in.shape[1], 0), dtype=np.int64)
+            elif need_estimate:
                 t_est = time.perf_counter() if self.timing.enabled else None
                 scores = decode_estimate(q_in, self.controller, layer_idx)
                 topk = decode_topk_np(
@@ -369,7 +376,7 @@ class QuestFeature(AlayaFeature):
             
             # Best-effort release of large temporaries.
             del q_sdpa, out_sdpa, topk
-            if need_estimate:
+            if scores is not None:
                 del scores
 
         # Best-effort release of per-layer QKV intermediates.

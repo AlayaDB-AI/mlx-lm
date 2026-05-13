@@ -369,7 +369,12 @@ def main():
             # Match LongBench reference behavior: skip chat template for specific tasks.
             if hasattr(tokenizer, "apply_chat_template") and base_name not in NO_CHAT_TEMPLATE_DATASETS:
                 messages = [{"role": "user", "content": prompt}]
-                prompt_formatted = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+                prompt_formatted = tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    enable_thinking=False,
+                )
             else:
                 prompt_formatted = prompt
 

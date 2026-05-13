@@ -1,7 +1,9 @@
+import os
 import time
 import mlx.core as mx
 import numpy as np
 from .kv_cache import QuestController, safe_to_numpy
+from .metal_sparse_attention import fused_sparse_decode_attention
 
 def apply_rope_in_place(
     q: mx.array,
@@ -232,6 +234,53 @@ def decode_sparse_attn(
     num_heads = q.shape[1] # H_q
     num_kv_heads = controller.kv_cache.num_heads # H_kv
     group_size = num_heads // num_kv_heads
+
+    if (
+        os.environ.get("ALAYAJET_QUEST_METAL_SPARSE") == "1"
+        and controller.need_estimate()
+        and len(controller.kv_indices_without_last) > 0
+    ):
+        active_indices = np.asarray(controller.kv_cache.active_indices, dtype=np.int64)
+        candidate_logical = np.asarray(controller.kv_indices_without_last, dtype=np.int64)
+        candidate_physical = active_indices[candidate_logical]
+        cache_key = (layer_idx, tuple(int(x) for x in candidate_physical.tolist()))
+        cached = controller._metal_sparse_cache.get(cache_key)
+        if cached is None:
+            for stale_key in list(controller._metal_sparse_cache):
+                if stale_key[0] == layer_idx:
+                    del controller._metal_sparse_cache[stale_key]
+            metadata = controller.metadata_pool[layer_idx, candidate_physical]
+            k_min = mx.array(metadata[:, 0].transpose(1, 0, 2)).astype(mx.float32)
+            k_max = mx.array(metadata[:, 1].transpose(1, 0, 2)).astype(mx.float32)
+            kv_pages = controller.kv_cache.load_pages(
+                layer_idx,
+                candidate_physical.tolist(),
+            ).astype(q.dtype)
+            controller._metal_sparse_cache[cache_key] = (k_min, k_max, kv_pages)
+        else:
+            k_min, k_max, kv_pages = cached
+
+        active_buffer_mx = controller.kv_cache.get_active_buffer_mx(layer_idx)
+        valid_len = controller.kv_cache.last_page_len
+        if active_buffer_mx is None:
+            raise RuntimeError("Active MX buffer missing during fused Metal sparse decode.")
+        last_k_mx = active_buffer_mx[0, :valid_len].astype(q.dtype)
+        last_v_mx = active_buffer_mx[1, :valid_len].astype(q.dtype)
+        fused_page_budget = controller.inference_page_budget
+        fused_budget_override = os.environ.get("ALAYAJET_QUEST_METAL_PAGE_BUDGET")
+        if fused_budget_override:
+            fused_page_budget = min(fused_page_budget, int(fused_budget_override))
+        out = fused_sparse_decode_attention(
+            q,
+            k_min,
+            k_max,
+            kv_pages,
+            last_k_mx,
+            last_v_mx,
+            page_budget=fused_page_budget,
+            scale=float(1.0 / np.sqrt(q.shape[-1])),
+        )
+        return out
     
     kv_head_indices = (np.arange(num_heads, dtype=np.int64) // group_size)[:, None]
     

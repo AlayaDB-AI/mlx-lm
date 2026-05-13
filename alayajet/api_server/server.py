@@ -666,12 +666,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Log Quest memory checkpoints during prefill",
     )
+    parser.add_argument(
+        "--quest-metal-sparse",
+        action="store_true",
+        help="Enable experimental fused Metal sparse decode attention for Quest",
+    )
+    parser.add_argument(
+        "--quest-metal-page-budget",
+        type=int,
+        default=None,
+        help=(
+            "Override the experimental fused Metal sparse page budget "
+            "(defaults to --page-budget when omitted)"
+        ),
+    )
     return parser
 
 
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.quest_metal_page_budget is not None and args.quest_metal_page_budget <= 0:
+        parser.error("--quest-metal-page-budget must be positive")
+    if args.quest_metal_sparse:
+        os.environ["ALAYAJET_QUEST_METAL_SPARSE"] = "1"
+    if args.quest_metal_page_budget is not None:
+        os.environ["ALAYAJET_QUEST_METAL_PAGE_BUDGET"] = str(
+            args.quest_metal_page_budget
+        )
 
     if mx.metal.is_available():
         wired_limit = mx.metal.device_info()["max_recommended_working_set_size"]
