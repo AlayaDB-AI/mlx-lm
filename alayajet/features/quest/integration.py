@@ -5,7 +5,7 @@ import sys
 import numpy as np
 from ..base import AlayaFeature
 from .kv_cache import QuestController
-from .ops import append_kv, decode_estimate, decode_topk_np, decode_sparse_attn, apply_rope_in_place
+from .ops import append_kv, decode_estimate, decode_topk_np, decode_topk_frame_ids_np, decode_topk_frame_ids_from_indices_np, decode_sparse_attn, apply_rope_in_place
 from .prefill_pipeline import prefill_with_kv_cache_pipelined
 from .timing import QuestTiming
 from ...patch_utils import replace_method, patch_class_property
@@ -22,6 +22,7 @@ class QuestFeature(AlayaFeature):
         trace_output: str | None = None,
         trace_phase: str | None = None,
         trace_decode_steps: int | None = 3,
+        page_size: int = 64,
         release_active_buffer_on_prefill: bool = True,
         log_prefill_layer_timing: bool = False,
         log_prefill_io_overlap: bool = False,
@@ -32,7 +33,10 @@ class QuestFeature(AlayaFeature):
         disable_os_cache: bool = True,
     ):
         super().__init__()
+        if page_size <= 0:
+            raise ValueError("page_size must be positive")
         self.page_budget = page_budget
+        self.page_size = page_size
         self.cache_dir = cache_dir
         self.async_disk_write = async_disk_write
         self.timing = QuestTiming(
@@ -125,13 +129,11 @@ class QuestFeature(AlayaFeature):
             head_dim = hidden_size // num_heads
 
         num_kv_heads = getattr(config, "num_key_value_heads", num_heads)
-        page_size = 64
-
         self.controller = QuestController(
             num_layers=num_layers,
             num_heads=num_heads,
             head_dim=head_dim,
-            page_size=page_size,
+            page_size=self.page_size,
             page_budget=self.page_budget,
             max_seq_len=self.max_seq_len,
             num_kv_heads=num_kv_heads,
@@ -339,7 +341,16 @@ class QuestFeature(AlayaFeature):
             use_fused_metal_sparse = (
                 os.environ.get("ALAYAJET_QUEST_METAL_SPARSE") == "1"
             )
-            if need_estimate and use_fused_metal_sparse:
+            use_selected_page_metal = (
+                os.environ.get("ALAYAJET_QUEST_METAL_SELECTED_PAGE", "0").lower()
+                in ("1", "true", "yes", "on")
+            )
+            use_latest_resident = (
+                use_selected_page_metal
+                and os.environ.get("ALAYAJET_QUEST_METAL_SELECTED_FRAME", "0").lower()
+                in ("resident", "resident_arena", "global")
+            )
+            if need_estimate and use_fused_metal_sparse and not use_selected_page_metal:
                 topk = np.empty((q_in.shape[1], 0), dtype=np.int64)
             elif need_estimate:
                 t_est = time.perf_counter() if self.timing.enabled else None
@@ -413,12 +424,19 @@ class QuestFeature(AlayaFeature):
             and layer_idx == self.controller.num_layers - 1
         ):
             hits, misses = self.controller.kv_cache.pop_lru_stats()
+            selected_hits, selected_misses = self.controller.kv_cache.pop_selected_page_stats()
             total = hits + misses
             hit_rate = (hits / total * 100.0) if total else 0.0
+            selected_total = selected_hits + selected_misses
+            selected_hit_rate = (
+                selected_hits / selected_total * 100.0 if selected_total else 0.0
+            )
             step_idx = max(self._decode_step - 1, 0)
             print(
                 f"[Quest][LRU] Step {step_idx} | hit {hit_rate:.2f}% "
-                f"(hits={hits}, misses={misses})"
+                f"(hits={hits}, misses={misses}) | selected-page hit "
+                f"{selected_hit_rate:.2f}% "
+                f"(hits={selected_hits}, misses={selected_misses})"
             )
         
         # Manually increment layer counter since we bypassed the engine hook

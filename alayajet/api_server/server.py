@@ -52,6 +52,7 @@ class AlayaModelProvider(base_server.ModelProvider):
                 timing_sync=self.cli_args.quest_timing_sync,
                 trace_output=self.cli_args.quest_trace_output or None,
                 trace_decode_steps=self.cli_args.quest_trace_decode_steps,
+                page_size=self.cli_args.quest_page_size,
                 log_prefill_layer_timing=self.cli_args.quest_prefill_layer_log,
                 log_prefill_io_overlap=self.cli_args.quest_prefill_io_log,
                 log_decode_lru_hit_rate=self.cli_args.quest_lru_log,
@@ -667,6 +668,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log Quest memory checkpoints during prefill",
     )
     parser.add_argument(
+        "--quest-page-size",
+        type=int,
+        default=64,
+        help="Quest KV page size in tokens; larger pages reduce page-count and random gather overhead",
+    )
+    parser.add_argument(
         "--quest-metal-sparse",
         action="store_true",
         help="Enable experimental fused Metal sparse decode attention for Quest",
@@ -689,6 +696,8 @@ def main():
 
     if args.quest_metal_page_budget is not None and args.quest_metal_page_budget <= 0:
         parser.error("--quest-metal-page-budget must be positive")
+    if args.quest_page_size <= 0:
+        parser.error("--quest-page-size must be positive")
     if args.quest_metal_sparse:
         os.environ["ALAYAJET_QUEST_METAL_SPARSE"] = "1"
     if args.quest_metal_page_budget is not None:

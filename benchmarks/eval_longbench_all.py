@@ -89,6 +89,7 @@ def main():
     parser.add_argument("--model", type=str, default="mlx-community/Qwen2.5-7B-Instruct-1M-4bit", help="Model path")
     parser.add_argument("--quest", action="store_true", help="Enable Quest Feature")
     parser.add_argument("--page-budget", type=int, default=128, help="Quest page budget")
+    parser.add_argument("--page-size", type=int, default=64, help="Quest page size in tokens")
     parser.add_argument(
         "--num-samples",
         type=int,
@@ -288,6 +289,7 @@ def main():
         
         engine = AlayaEngine.with_quest(
             page_budget=args.page_budget, 
+            page_size=args.page_size,
             cache_dir=args.cache_dir,
             async_disk_write=True,
             timing=args.quest_timing,
@@ -299,7 +301,7 @@ def main():
             log_decode_lru_hit_rate=args.quest_lru_log,
             log_memory=args.quest_mem_log,
             log_memory_sync=args.quest_timing_sync,
-            log_prefill_progress=True,
+            log_prefill_progress=False,
             disable_os_cache=args.quest_disable_os_cache,
         )
         

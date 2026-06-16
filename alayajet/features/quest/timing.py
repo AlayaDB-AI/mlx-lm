@@ -42,6 +42,7 @@ class QuestTiming:
             "decode_disk_read",
             "decode_last_page",
             "decode_stream_attn",
+            "decode_selected_page_metal_attn",
             "decode_fused_metal_sparse_attn",
         }
         self._trace_hidden_keys = {
@@ -135,6 +136,7 @@ class QuestTiming:
                 "decode_disk_read",
                 "decode_last_page",
                 "decode_stream_attn",
+                "decode_selected_page_metal_attn",
             ):
                 fmt_line(key, denom=decode_total)
 
@@ -178,6 +180,7 @@ class QuestTiming:
                 "decode_disk_read",
                 "decode_last_page",
                 "decode_stream_attn",
+                "decode_selected_page_metal_attn",
             ]
         elif self.trace_phase == "prefill":
             preferred = []
